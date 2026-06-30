@@ -1,0 +1,54 @@
+plugins {
+    id 'java-gradle-plugin'
+    id 'maven-publish'
+    // Uncomment to publish to the Gradle Plugin Portal (requires the plugin-publish plugin):
+    // id 'com.gradle.plugin-publish' version '1.3.1'
+}
+
+group = 'io.github.kukis13'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+gradlePlugin {
+    website = 'https://github.com/kukis13/parallel-zip-gradle-plugin'
+    vcsUrl = 'https://github.com/kukis13/parallel-zip-gradle-plugin.git'
+    plugins {
+        parallelZip {
+            id = 'io.github.kukis13.parallel-zip'
+            implementationClass = 'io.github.kukis13.parallelzip.ParallelZipPlugin'
+            displayName = 'Parallel Zip'
+            description = 'A multithreaded, reproducible drop-in for slow Zip tasks. ' +
+                    'Compresses entries across all cores (DEFLATE) or STOREs them for maximum speed.'
+            tags.set(['zip', 'archive', 'parallel', 'performance', 'reproducible-builds'])
+        }
+    }
+}
+
+// Run the functional tests in a dedicated source set against the plugin under test.
+testing {
+    suites {
+        test {
+            useJUnitJupiter()
+        }
+    }
+}
+
+tasks.named('test') {
+    // The engine spins up its own threads; give the test JVM a little headroom.
+    maxHeapSize = '1g'
+}
