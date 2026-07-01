@@ -69,26 +69,16 @@ records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
 On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled native
 [libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
-`Deflater`. On raw compressible buffers it's ~2–2.5× faster at the same level, at the
-cost of somewhat larger output (libdeflate's level numbering isn't ratio-equivalent to
-zlib's; expect roughly 8–10% bigger on purely-compressible data at the same `level`) —
-but at the whole-archive level on real projects (see [Benchmarks](#benchmarks)), that
-size difference all but disappears, typically landing within ±0.3% of the JDK codec,
-since most bytes in a jar-heavy archive are already-compressed content that neither
-codec can shrink further. It only covers the in-memory fast path (libdeflate has no
-streaming API), so large/spilled entries always use the JDK `Deflater`. Every other
-platform/arch, or any failure loading the native build, falls back to the pure-Java
-path automatically with no configuration needed.
+`Deflater` — faster, and within ~0.3% of the same archive size in practice (see
+[Benchmarks](#benchmarks)). It only covers the in-memory fast path (no streaming API),
+so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or any
+failure loading the native build, falls back to the pure-Java path automatically.
 
 ## Benchmarks
 
-Measured across the official binary distributions of ten popular open-source Java
-projects: extract the distribution, then archive the identical directory tree four ways
-— Gradle `Zip` (DEFLATE, baseline), `parallel-zip` DEFLATE on the JDK codec, `parallel-zip`
-DEFLATE with the native libdeflate accelerator, and `parallel-zip` STORE. Same machine
-throughout: 12 logical cores, JDK 21, warm file cache. (Baseline timings carry ~2–5%
-run-to-run noise, consistent with what we saw testing heap size separately — read the
-×-speedups as the meaningful signal, not the absolute seconds.)
+Eleven popular open-source Java projects' official binary distributions, archived four
+ways — Gradle `Zip` (baseline), `parallel-zip` DEFLATE (JDK codec), DEFLATE
+(libdeflate), and STORE. Same machine: 12 logical cores, JDK 21, warm cache.
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|--:|
@@ -101,41 +91,19 @@ run-to-run noise, consistent with what we saw testing heap size separately — r
 | Spark 3.5.3 | 1,825 | 427.9 MiB | 9.22 s | 4.44 s (**2.1×**) | 4.24 s (**2.2×**) | 1.03 s (**9.0×**) | +10.4% |
 | Gradle 8.14.3 | 22,427 | 500.2 MiB | 9.86 s | 4.74 s (**2.1×**) | 4.26 s (**2.3×**) | 3.30 s (**3.0×**) | +108.6% |
 | Flink 1.20.0 | 167 | 502.8 MiB | 10.76 s | 5.05 s (**2.1×**) | 5.03 s (**2.1×**) | 1.05 s (**10.2×**) | +8.9% |
-| SonarQube distribution | 610 | 927.9 MiB | 19.82 s | 5.84 s (**3.4×**) | 5.64 s (**3.5×**) | 1.88 s (**10.6×**) | +7.4% |
+| SonarQube Community Build 26.6 | 749 | 966.6 MiB | 20.93 s | 6.56 s (**3.2×**) | 6.25 s (**3.4×**) | 2.00 s (**10.5×**) | +9.2% |
+| Hadoop 3.4.0¹ | 20,220 | 1,733.6 MiB | 33.09 s | 21.19 s (**1.6×**) | 21.90 s (1.5×) | 6.02 s (**5.5×**) | +77.5% |
 
-The DEFLATE columns never produce a larger archive than the baseline (the per-entry
-STORE fallback + comparable codec ratios guarantee that in practice), so either is a
-safe default. STORE trades size for speed, and how much size depends entirely on how
-compressible the content already is:
+¹ Hadoop's raw size and file count needed `-Xmx4g`; every other row here runs on the
+default 1g heap used for this benchmark. It's also the clearest case where libdeflate
+doesn't help: a few individual files (500+ MiB) dominate its wall time and always stream
+through the JDK codec (see [Options](#options)), so the libdeflate column is a wash.
 
-- **Jar-heavy binary distributions** (most of the table above) are mostly pre-compressed
-  bytes already: DEFLATE gets **1.9–3.4×** faster on the JDK codec, **2.0–3.7×** with
-  libdeflate, and STORE gets **3.0–10.6×** faster for a **4–22%** size increase (STORE's
-  win varies more than DEFLATE's here — it's I/O-bound, so how much it gains depends on
-  file count and average entry size, not just how compressible the content is). This is
-  the sweet spot the plugin was built for.
-- **libdeflate helps almost everywhere, but not uniformly.** It's consistently faster
-  than the JDK codec, sometimes by a lot (Cassandra, Solr, HBase go from ~2.8–3.3× to
-  ~3.4–3.5×), sometimes marginally (Flink barely moves, 2.1× either way) — when a corpus
-  has a few huge files dominating wall time rather than many mid-sized compressible
-  entries, the codec matters less than I/O.
-- **Many small, highly-compressible files can flip DEFLATE negative.** Groovy's tree of
-  `.class`/javadoc output is the one corpus here where DEFLATE is *slower* than the
-  single-threaded baseline on both codecs (0.85× JDK, 0.90× libdeflate) — the parallel
-  pipeline's per-entry overhead (queueing, semaphore handoff) outweighs the compression
-  saved when each entry is already cheap to compress. libdeflate's raw speed narrows the
-  gap without closing it. Gradle's own distribution has similarly many files (22k+) but
-  doesn't show this regression (still 2.1–2.3× faster) — it's specifically Groovy's mix
-  of many *small* entries that triggers it, not file count alone.
-- **STORE mode's size cost tracks how compressible the content is, not file count.**
-  Groovy and Gradle both skip DEFLATE on highly redundant, easily-compressed content, so
-  STORE more than doubles the archive there (+273.6% and +108.6%) even though Gradle's
-  DEFLATE performance is otherwise unremarkable.
-- **Recommendation:** default to `store = false` (DEFLATE) — it's a safe, usually-faster,
-  never-bigger-by-much drop-in, and the native accelerator (when bundled for your
-  platform) improves on that further for free. Only opt into `store = true` for archives
-  you already know are jar/binary-heavy, where the size cost is small and the speedup
-  is large.
+DEFLATE never produces a bigger archive than the baseline in practice, so it's the safe
+default. The one exception is Groovy: many small, already-cheap-to-compress files, where
+per-entry pipeline overhead outweighs the compression saved — the only corpus here where
+DEFLATE is slower than single-threaded `Zip`. Use `store = true` only for archives you
+already know are jar/binary-heavy, where STORE's size cost is small and the speedup large.
 
 ## Reproducibility
 
@@ -154,6 +122,12 @@ unaffected either way.
 ## Roadmap
 
 - Optional per-entry parallel *reads* for filter-free specs (skip materialization).
+
+## Contributing
+
+PRs welcome — bug fixes, new platform support, benchmarks against other projects,
+anything. Just lead with a strong **why**: what's slow or broken today, and evidence
+it's better after.
 
 ## Building
 
