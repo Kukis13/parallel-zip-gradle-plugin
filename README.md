@@ -2,16 +2,16 @@
 
 [![CI](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml)
 
-Gradle's built-in `Zip` task is **single-threaded** and re-DEFLATEs everything, even
-content that is already compressed (jars, `.gz`, images). For large, jar-heavy
-distributions that makes archiving one of the slowest tasks in the build.
-
 `parallel-zip` is a small, dependency-free custom task that compresses entries across
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
 **byte-for-byte reproducible** archive. It extends `AbstractArchiveTask`, so it's a
 **drop-in for `Zip`** — the full `CopySpec` DSL works unchanged.
 
 ## Why
+
+Gradle's built-in `Zip` task is **single-threaded** and re-DEFLATEs everything, even
+content that is already compressed (jars, `.gz`, images). For large, jar-heavy
+distributions that makes archiving one of the slowest tasks in the build.
 
 Gradle has had an open request to build archives in parallel since 2017
 ([gradle/gradle#2774](https://github.com/gradle/gradle/issues/2774)) — a spike showed
