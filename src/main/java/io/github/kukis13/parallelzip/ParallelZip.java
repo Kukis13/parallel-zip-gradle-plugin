@@ -93,10 +93,11 @@ public abstract class ParallelZip extends DefaultTask {
         ParallelZipWriter.Result r = ParallelZipWriter.write(sources, out, store, level, threads, preserve);
 
         getLogger().lifecycle(String.format(
-                "ParallelZip -> %s (%d entries, %.1f MiB, %s, %d threads, %.2fx) in %d ms",
+                "ParallelZip -> %s (%d entries, %.1f MiB, %s, %d threads, %.2fx%s) in %d ms",
                 out.getFileName(), r.entryCount(), r.archiveSize() / 1048576.0,
                 store ? "STORE" : "DEFLATE l" + (level < 0 ? 6 : level), threads,
                 r.rawBytes() == 0 ? 1.0 : (double) r.storedBytes() / r.rawBytes(),
+                r.zip64() ? ", ZIP64" : "",
                 r.enumerateMs() + r.compressWriteMs()));
     }
 }

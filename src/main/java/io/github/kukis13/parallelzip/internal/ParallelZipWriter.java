@@ -32,8 +32,12 @@ import java.util.zip.Deflater;
  * deterministic regardless of thread count. With {@code preserveTimestamps=false} the
  * archive is byte-for-byte reproducible across rebuilds of identical content.</p>
  *
- * <p>ZIP64 is not yet implemented; the writer fails fast if the archive would require it
- * (&gt; 65,535 entries, any file &ge; 4 GiB, or total size &ge; 4 GiB).</p>
+ * <p>ZIP64 is supported: archives larger than 4 GiB, more than 65,535 entries, and
+ * per-entry local-header offsets or sizes beyond 4 GiB all emit the appropriate ZIP64
+ * extra fields and end-of-central-directory records. The only unsupported case is a
+ * <em>single</em> entry whose uncompressed size reaches 2 GiB, because the in-memory
+ * pipeline reads each file into a {@code byte[]} (streaming large entries is on the
+ * roadmap); such an entry fails fast with a clear message.</p>
  */
 public final class ParallelZipWriter {
 
@@ -42,8 +46,14 @@ public final class ParallelZipWriter {
     static final int LFH_SIG = 0x04034b50;
     static final int CDH_SIG = 0x02014b50;
     static final int EOCD_SIG = 0x06054b50;
+    static final int EOCD64_SIG = 0x06064b50;
+    static final int EOCD64_LOC_SIG = 0x07064b50;
+    static final int Z64_EXTRA_ID = 0x0001;
     static final int FLAG_UTF8 = 0x0800;
     static final long MAX32 = 0xFFFFFFFFL;
+    static final int MAX16 = 0xFFFF;
+    // Largest byte[] the JVM can allocate; single entries above this need streaming.
+    static final long MAX_ARRAY = Integer.MAX_VALUE - 8;
 
     // Fixed DOS date/time used when timestamps are not preserved: 1980-01-01 00:00:00.
     static final int FIXED_DOS_TIME = 0;
@@ -53,7 +63,7 @@ public final class ParallelZipWriter {
     public record Source(Path baseDir, String prefix) {}
 
     public record Result(long archiveSize, int entryCount, long rawBytes, long storedBytes,
-                         long enumerateMs, long compressWriteMs) {}
+                         long enumerateMs, long compressWriteMs, boolean zip64) {}
 
     static final class Entry {
         String name;
@@ -75,18 +85,24 @@ public final class ParallelZipWriter {
         }
     }
 
+    /** Public entry point used by the Gradle task. */
     public static Result write(List<Source> sources, Path out, boolean store, int level,
                                int threads, boolean preserveTimestamps)
+            throws IOException, InterruptedException {
+        return write(sources, out, store, level, threads, preserveTimestamps, false);
+    }
+
+    /**
+     * @param forceZip64 test hook: emit ZIP64 records/extra fields even when values fit
+     *                   in 32 bits, to exercise the ZIP64 encoding without huge inputs.
+     */
+    static Result write(List<Source> sources, Path out, boolean store, int level,
+                        int threads, boolean preserveTimestamps, boolean forceZip64)
             throws IOException, InterruptedException {
 
         long t0 = System.nanoTime();
         List<Entry> entries = enumerate(sources, preserveTimestamps);
         long tEnum = System.nanoTime();
-
-        if (entries.size() > 0xFFFF) {
-            throw new UnsupportedOperationException(
-                    "Archive has " + entries.size() + " entries; > 65535 requires ZIP64 (not yet supported).");
-        }
 
         Files.createDirectories(out.toAbsolutePath().getParent());
 
@@ -97,6 +113,7 @@ public final class ParallelZipWriter {
 
         long[] stats = new long[2]; // raw, stored
         final long[] archiveSize = {0};
+        final boolean[] usedZip64 = {false};
         final IOException[] writerError = {null};
 
         Thread writer = new Thread(() -> {
@@ -110,21 +127,17 @@ public final class ParallelZipWriter {
                     Compressed c = f.get();
                     inFlight.release();
                     long localOffset = offset;
-                    byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method);
+                    byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
                     os.write(lh);
                     os.write(c.data, 0, (int) c.compSize);
                     offset += lh.length + c.compSize;
-                    if (offset > MAX32) {
-                        throw new UnsupportedOperationException(
-                                "Archive exceeds 4 GiB; ZIP64 required (not yet supported).");
-                    }
                     order.add(c.e);
                     meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
                     stats[0] += c.rawSize; stats[1] += c.compSize;
                 }
-                byte[] cd = buildCentralDirectory(order, meta, offset);
-                os.write(cd);
-                archiveSize[0] = offset + cd.length;
+                byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
+                os.write(tail);
+                archiveSize[0] = offset + tail.length;
             } catch (IOException ex) {
                 writerError[0] = ex;
             } catch (Exception ex) {
@@ -147,7 +160,7 @@ public final class ParallelZipWriter {
         }
         long tEnd = System.nanoTime();
         return new Result(archiveSize[0], entries.size(), stats[0], stats[1],
-                (tEnum - t0) / 1_000_000L, (tEnd - tEnum) / 1_000_000L);
+                (tEnum - t0) / 1_000_000L, (tEnd - tEnum) / 1_000_000L, usedZip64[0]);
     }
 
     private static Compressed compress(Entry e, boolean store, Deflater def) {
@@ -199,9 +212,10 @@ public final class ParallelZipWriter {
                     e.nameBytes = name.getBytes(StandardCharsets.UTF_8);
                     e.file = dir ? null : p;
                     e.size = dir ? 0 : Files.size(p);
-                    if (e.size > MAX32) {
+                    if (e.size > MAX_ARRAY) {
                         throw new UnsupportedOperationException(
-                                "File >= 4 GiB requires ZIP64 (not yet supported): " + name);
+                                "Entry is " + e.size + " bytes; single entries >= 2 GiB are not yet "
+                                + "supported (needs streaming compression): " + name);
                     }
                     int[] dt = preserveTimestamps
                             ? dosDateTime(Files.getLastModifiedTime(p).toMillis())
@@ -224,58 +238,117 @@ public final class ParallelZipWriter {
         return p;
     }
 
-    private static byte[] localHeader(Entry e, long crc, long compSize, long rawSize, int method) {
-        ByteBuffer b = ByteBuffer.allocate(30 + e.nameBytes.length).order(ByteOrder.LITTLE_ENDIAN);
+    private static byte[] localHeader(Entry e, long crc, long compSize, long rawSize,
+                                      int method, boolean force) {
+        boolean z64 = force || compSize >= MAX32 || rawSize >= MAX32;
+        int extraLen = z64 ? 20 : 0; // id(2)+size(2)+uncompressed(8)+compressed(8)
+        ByteBuffer b = ByteBuffer.allocate(30 + e.nameBytes.length + extraLen).order(ByteOrder.LITTLE_ENDIAN);
         b.putInt(LFH_SIG);
-        b.putShort((short) 20);
+        b.putShort((short) (z64 ? 45 : 20));       // version needed
         b.putShort((short) FLAG_UTF8);
         b.putShort((short) method);
         b.putShort((short) e.dosTime);
         b.putShort((short) e.dosDate);
         b.putInt((int) crc);
-        b.putInt((int) compSize);
-        b.putInt((int) rawSize);
+        b.putInt((int) (z64 ? MAX32 : compSize));  // compressed size (or sentinel)
+        b.putInt((int) (z64 ? MAX32 : rawSize));   // uncompressed size (or sentinel)
         b.putShort((short) e.nameBytes.length);
-        b.putShort((short) 0);
+        b.putShort((short) extraLen);
         b.put(e.nameBytes);
+        if (z64) {
+            b.putShort((short) Z64_EXTRA_ID);
+            b.putShort((short) 16);                // data size: two 8-byte values
+            b.putLong(rawSize);                    // original size
+            b.putLong(compSize);                   // compressed size
+        }
         return b.array();
     }
 
-    private static byte[] buildCentralDirectory(List<Entry> order, List<long[]> meta, long cdOffset) {
-        int size = 0;
-        for (Entry e : order) size += 46 + e.nameBytes.length;
-        ByteBuffer b = ByteBuffer.allocate(size + 22).order(ByteOrder.LITTLE_ENDIAN);
+    /** Builds the central directory plus the (ZIP64) end-of-central-directory records. */
+    private static byte[] buildCentralDirectoryAndEnd(List<Entry> order, List<long[]> meta,
+                                                      long cdOffset, boolean force, boolean[] usedZip64) {
+        int cap = 98 + 64; // EOCD64(56) + locator(20) + EOCD(22) + slack
+        for (Entry e : order) cap += 46 + e.nameBytes.length + 28; // 28 = max ZIP64 extra
+        ByteBuffer b = ByteBuffer.allocate(cap).order(ByteOrder.LITTLE_ENDIAN);
+
+        boolean anyEntryZ64 = false;
         for (int i = 0; i < order.size(); i++) {
             Entry e = order.get(i);
-            long[] m = meta.get(i); // crc, comp, raw, method, offset
+            long[] m = meta.get(i);               // crc, comp, raw, method, offset
+            long comp = m[1], raw = m[2], off = m[4];
+            int method = (int) m[3];
+
+            boolean z64raw = force || raw >= MAX32;
+            boolean z64comp = force || comp >= MAX32;
+            boolean z64off = force || off >= MAX32;
+            boolean z64 = z64raw || z64comp || z64off;
+            anyEntryZ64 |= z64;
+            int extraData = (z64raw ? 8 : 0) + (z64comp ? 8 : 0) + (z64off ? 8 : 0);
+            int extraLen = z64 ? 4 + extraData : 0;
+
             b.putInt(CDH_SIG);
-            b.putShort((short) 20);
-            b.putShort((short) 20);
+            b.putShort((short) (z64 ? 45 : 20));   // version made by
+            b.putShort((short) (z64 ? 45 : 20));   // version needed
             b.putShort((short) FLAG_UTF8);
-            b.putShort((short) (int) m[3]);
+            b.putShort((short) method);
             b.putShort((short) e.dosTime);
             b.putShort((short) e.dosDate);
-            b.putInt((int) m[0]);
-            b.putInt((int) m[1]);
-            b.putInt((int) m[2]);
+            b.putInt((int) m[0]);                  // crc
+            b.putInt((int) (z64comp ? MAX32 : comp));
+            b.putInt((int) (z64raw ? MAX32 : raw));
             b.putShort((short) e.nameBytes.length);
-            b.putShort((short) 0);
-            b.putShort((short) 0);
-            b.putShort((short) 0);
-            b.putShort((short) 0);
-            b.putInt(e.dir ? 0x10 : 0);
-            b.putInt((int) m[4]);
+            b.putShort((short) extraLen);
+            b.putShort((short) 0);                 // comment length
+            b.putShort((short) 0);                 // disk number start
+            b.putShort((short) 0);                 // internal attrs
+            b.putInt(e.dir ? 0x10 : 0);            // external attrs
+            b.putInt((int) (z64off ? MAX32 : off));
             b.put(e.nameBytes);
+            if (z64) {
+                b.putShort((short) Z64_EXTRA_ID);
+                b.putShort((short) extraData);
+                if (z64raw) b.putLong(raw);        // fixed order: uncompressed, compressed, offset
+                if (z64comp) b.putLong(comp);
+                if (z64off) b.putLong(off);
+            }
         }
+
+        long cdSize = b.position();
         int count = order.size();
+        boolean needZip64 = force || anyEntryZ64 || count >= MAX16
+                || cdOffset >= MAX32 || cdSize >= MAX32;
+        usedZip64[0] = needZip64;
+
+        if (needZip64) {
+            long eocd64Offset = cdOffset + cdSize;
+            // ZIP64 end of central directory record.
+            b.putInt(EOCD64_SIG);
+            b.putLong(44);                         // size of remaining record
+            b.putShort((short) 45);                // version made by
+            b.putShort((short) 45);                // version needed
+            b.putInt(0);                           // this disk
+            b.putInt(0);                           // disk with start of CD
+            b.putLong(count);                      // entries on this disk
+            b.putLong(count);                      // total entries
+            b.putLong(cdSize);
+            b.putLong(cdOffset);
+            // ZIP64 end of central directory locator.
+            b.putInt(EOCD64_LOC_SIG);
+            b.putInt(0);                           // disk with ZIP64 EOCD
+            b.putLong(eocd64Offset);
+            b.putInt(1);                           // total number of disks
+        }
+
+        // Regular end of central directory record (sentinels when values overflow).
         b.putInt(EOCD_SIG);
         b.putShort((short) 0);
         b.putShort((short) 0);
-        b.putShort((short) count);
-        b.putShort((short) count);
-        b.putInt(size);
-        b.putInt((int) cdOffset);
-        b.putShort((short) 0);
+        b.putShort((short) (count >= MAX16 ? MAX16 : count));
+        b.putShort((short) (count >= MAX16 ? MAX16 : count));
+        b.putInt((int) (cdSize >= MAX32 ? MAX32 : cdSize));
+        b.putInt((int) (cdOffset >= MAX32 ? MAX32 : cdOffset));
+        b.putShort((short) 0);                     // comment length
+
         byte[] out = new byte[b.position()];
         b.flip();
         b.get(out);
