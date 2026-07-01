@@ -26,19 +26,19 @@ import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 
 /**
- * Core parallel ZIP writer. Stateless and reusable; the Gradle task is a thin wrapper.
+ * Core parallel ZIP writer. Stateless and reusable; both the directory front-end
+ * ({@link #write}) and the Gradle {@code CopyAction} feed it a list of {@link Entry}.
  *
  * <p>Pipeline: every entry is compressed (STORE or DEFLATE) on a worker pool, while a
- * single writer thread drains results <em>in a fixed, name-sorted order</em> and streams
- * them to the archive. Parallelism never affects the byte layout, so output is
- * deterministic regardless of thread count. With {@code preserveTimestamps=false} the
- * archive is byte-for-byte reproducible across rebuilds of identical content.</p>
+ * single writer thread drains results <em>in the given list order</em> and streams them
+ * to the archive. Parallelism never affects the byte layout, so output is deterministic
+ * regardless of thread count. With fixed timestamps the archive is byte-for-byte
+ * reproducible across rebuilds of identical content.</p>
  *
- * <p>Small entries are compressed entirely in memory (the fast path). Entries larger than
- * {@link #SPILL_THRESHOLD} are streamed through the deflater to a temporary file (or read
- * directly from the source when stored), so memory stays bounded and a single entry may be
- * arbitrarily large. ZIP64 is emitted automatically for archives &gt; 4 GiB, more than
- * 65,535 entries, or per-entry sizes/offsets beyond 4 GiB.</p>
+ * <p>Small entries are compressed in memory; entries larger than {@link #SPILL_THRESHOLD}
+ * are streamed through the deflater to a temp file so a single entry may be arbitrarily
+ * large. ZIP64 is emitted automatically for archives &gt; 4 GiB, more than 65,535 entries,
+ * or per-entry sizes/offsets beyond 4 GiB.</p>
  */
 public final class ParallelZipWriter {
 
@@ -54,33 +54,244 @@ public final class ParallelZipWriter {
     static final long MAX32 = 0xFFFFFFFFL;
     static final int MAX16 = 0xFFFF;
     /** Entries larger than this are streamed (spilled) instead of held in memory. */
-    static final long SPILL_THRESHOLD = 128L << 20; // 128 MiB
+    public static final long SPILL_THRESHOLD = 8L << 20; // 8 MiB
     static final int STREAM_BUF = 1 << 16;
 
     // Fixed DOS date/time used when timestamps are not preserved: 1980-01-01 00:00:00.
-    static final int FIXED_DOS_TIME = 0;
-    static final int FIXED_DOS_DATE = 0x21;
+    public static final int FIXED_DOS_TIME = 0;
+    public static final int FIXED_DOS_DATE = 0x21;
 
-    /** A source tree to be added under an optional archive path prefix. */
+    /** A source tree to be added under an optional archive path prefix (directory front-end). */
     public record Source(Path baseDir, String prefix) {}
 
     public record Result(long archiveSize, int entryCount, long rawBytes, long storedBytes,
                          long enumerateMs, long compressWriteMs, boolean zip64) {}
 
-    static final class Entry {
+    /**
+     * One archive entry. Content is one of: a directory (no content), inline {@code data}
+     * (materialized in memory), or a {@code file} to read/stream (a real source or a temp).
+     */
+    public static final class Entry {
         String name;
-        Path file;          // null for directory
         boolean dir;
         int dosTime, dosDate;
+        int externalAttr;
         byte[] nameBytes;
         long size;
+        Path file;          // file-backed content (real or temp); null otherwise
+        byte[] inline;      // in-memory content; null otherwise
+        boolean fileIsTemp; // delete file after it has been consumed
+    }
+
+    public static Entry dirEntry(String name, int dosTime, int dosDate, int externalAttr) {
+        Entry e = new Entry();
+        e.dir = true;
+        e.name = name.endsWith("/") ? name : name + "/";
+        e.nameBytes = e.name.getBytes(StandardCharsets.UTF_8);
+        e.dosTime = dosTime; e.dosDate = dosDate;
+        e.externalAttr = externalAttr;
+        return e;
+    }
+
+    public static Entry fileEntry(String name, Path file, boolean fileIsTemp, long size,
+                                  int dosTime, int dosDate, int externalAttr) {
+        Entry e = baseFile(name, dosTime, dosDate, externalAttr);
+        e.file = file; e.fileIsTemp = fileIsTemp; e.size = size;
+        return e;
+    }
+
+    public static Entry inlineEntry(String name, byte[] data, int dosTime, int dosDate, int externalAttr) {
+        Entry e = baseFile(name, dosTime, dosDate, externalAttr);
+        e.inline = data; e.size = data.length;
+        return e;
+    }
+
+    private static Entry baseFile(String name, int dosTime, int dosDate, int externalAttr) {
+        Entry e = new Entry();
+        e.name = name;
+        e.nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        e.dosTime = dosTime; e.dosDate = dosDate;
+        e.externalAttr = externalAttr;
+        return e;
+    }
+
+    /** Directory front-end: walk source trees and archive them. Used by tests and the simple API. */
+    public static Result write(List<Source> sources, Path out, boolean store, int level,
+                               int threads, boolean preserveTimestamps)
+            throws IOException, InterruptedException {
+        return write(sources, out, store, level, threads, preserveTimestamps, false, SPILL_THRESHOLD);
+    }
+
+    static Result write(List<Source> sources, Path out, boolean store, int level,
+                        int threads, boolean preserveTimestamps, boolean forceZip64)
+            throws IOException, InterruptedException {
+        return write(sources, out, store, level, threads, preserveTimestamps, forceZip64, SPILL_THRESHOLD);
+    }
+
+    static Result write(List<Source> sources, Path out, boolean store, int level,
+                        int threads, boolean preserveTimestamps, boolean forceZip64, long spillThreshold)
+            throws IOException, InterruptedException {
+        long t0 = System.nanoTime();
+        List<Entry> entries = enumerate(sources, preserveTimestamps);
+        long enumerateMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        Path spillDir = Files.createTempDirectory(prepareParent(out), ".pzip-");
+        try {
+            Result r = writeEntries(entries, out, store, level, threads, forceZip64, spillThreshold, spillDir);
+            return new Result(r.archiveSize(), r.entryCount(), r.rawBytes(), r.storedBytes(),
+                    enumerateMs, r.compressWriteMs(), r.zip64());
+        } finally {
+            deleteRecursively(spillDir);
+        }
+    }
+
+    static Path prepareParent(Path out) throws IOException {
+        Path parent = out.toAbsolutePath().getParent();
+        Files.createDirectories(parent);
+        return parent;
     }
 
     /**
-     * The compressed form of one entry. Either {@code data} holds the payload in memory,
-     * or {@code streamFrom} points to a file (a spill temp, or the source itself when
-     * stored) that the writer streams {@code compSize} bytes from.
+     * Core: compress {@code entries} in parallel and write them to {@code out} in list order.
+     * The caller owns {@code spillDir} (creation and cleanup).
      */
+    public static Result writeEntries(List<Entry> entries, Path out, boolean store, int level,
+                                      int threads, boolean forceZip64, long spillThreshold, Path spillDir)
+            throws IOException, InterruptedException {
+        Sink sink = new Sink(out, store, level, threads, forceZip64, spillThreshold, spillDir);
+        for (Entry e : entries) sink.add(e);
+        return sink.finish();
+    }
+
+    /**
+     * A running compress-and-write pipeline. Entries are handed in via {@link #add} (which
+     * blocks when the bounded in-flight window is full, providing backpressure), a worker
+     * pool compresses them, and a single writer thread streams them out in submission order.
+     * This lets a producer feed entries incrementally without materializing them all at once.
+     */
+    public static final class Sink {
+        private static final long MIB = 1L << 20;
+        private final ExecutorService pool;
+        private final ThreadLocal<Deflater> deflaters;
+        private final Semaphore countFlight;   // bounds the NUMBER of in-flight entries
+        private final Semaphore byteFlight;     // bounds in-memory BYTES held (in MiB units)
+        private final int budgetMiB;
+        private final BlockingQueue<Item> queue;
+        private final Thread writerThread;
+        private final boolean store;
+        private final int level;
+        private final long spillThreshold;
+        private final Path spillDir;
+        private final long startNanos;
+
+        private final long[] stats = new long[2];   // raw, stored
+        private final boolean[] usedZip64 = {false};
+        private long archiveSize;
+        private int entryCount;
+        private volatile IOException writerError;
+
+        /** A submitted future together with the byte-budget permits it holds. */
+        private record Item(Future<Compressed> future, int permits) {}
+        private static final Item POISON_ITEM = new Item(null, 0);
+
+        public Sink(Path out, boolean store, int level, int threads,
+                    boolean forceZip64, long spillThreshold, Path spillDir) {
+            this.store = store;
+            this.level = level;
+            this.spillThreshold = spillThreshold;
+            this.spillDir = spillDir;
+            this.pool = Executors.newFixedThreadPool(threads);
+            this.deflaters = ThreadLocal.withInitial(() -> new Deflater(level, true));
+            this.countFlight = new Semaphore(threads * 4);
+            // Cap in-memory bytes to a fraction of the heap so entries can't OOM the daemon.
+            this.budgetMiB = (int) Math.max(16, Math.min(1024, Runtime.getRuntime().maxMemory() / 6 / MIB));
+            this.byteFlight = new Semaphore(budgetMiB);
+            this.queue = new ArrayBlockingQueue<>(threads * 4 + 1);
+            this.startNanos = System.nanoTime();
+            this.writerThread = new Thread(() -> runWriter(out, forceZip64), "parallel-zip-writer");
+            this.writerThread.start();
+        }
+
+        public void add(Entry e) throws InterruptedException {
+            int permits = permitsFor(e);
+            byteFlight.acquire(permits);   // backpressure on memory; released by the writer
+            countFlight.acquire();
+            Future<Compressed> f = pool.submit(() -> compress(e, store, level, deflaters.get(), spillThreshold, spillDir));
+            queue.put(new Item(f, permits));
+        }
+
+        /**
+         * Heap a not-yet-written entry costs, in MiB permits. A DEFLATE entry holds the raw
+         * bytes AND the compressed buffer at once (~2x), a STORE entry only the raw bytes,
+         * and a streamed (large) entry ~nothing. Kept conservative to avoid OOM on small heaps.
+         */
+        private int permitsFor(Entry e) {
+            long mem;
+            if (e.inline != null) mem = e.size;
+            else if (e.file != null && e.size <= spillThreshold) mem = e.size; // read into a byte[]
+            else return 0; // directory, or large entry that streams via a temp file
+            if (!store) mem *= 2; // raw + compressed buffer resident together
+            return (int) Math.max(1, Math.min(budgetMiB, (mem + MIB - 1) / MIB));
+        }
+
+        public Result finish() throws IOException, InterruptedException {
+            try {
+                queue.put(POISON_ITEM);
+                writerThread.join();
+            } finally {
+                pool.shutdown();
+            }
+            if (writerError != null) throw writerError;
+            long ms = (System.nanoTime() - startNanos) / 1_000_000L;
+            return new Result(archiveSize, entryCount, stats[0], stats[1], 0, ms, usedZip64[0]);
+        }
+
+        private void runWriter(Path out, boolean forceZip64) {
+            List<Entry> order = new ArrayList<>();
+            List<long[]> meta = new ArrayList<>();
+            boolean failed = false;
+            long offset = 0;
+            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out), 1 << 20)) {
+                while (true) {
+                    Item item = queue.take();
+                    if (item == POISON_ITEM) break;
+                    Compressed c = null;
+                    try {
+                        c = item.future().get();
+                    } catch (Exception ex) {
+                        if (writerError == null) writerError = asIO(ex);
+                        failed = true;
+                    }
+                    countFlight.release();               // always release to avoid producer deadlock
+                    byteFlight.release(item.permits());
+                    if (failed || c == null) continue;   // keep draining the queue
+                    long localOffset = offset;
+                    byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
+                    os.write(lh);
+                    writePayload(os, c);
+                    offset += lh.length + c.compSize;
+                    order.add(c.e);
+                    meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
+                    stats[0] += c.rawSize; stats[1] += c.compSize;
+                }
+                if (!failed) {
+                    byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
+                    os.write(tail);
+                    archiveSize = offset + tail.length;
+                    entryCount = order.size();
+                }
+            } catch (Exception ex) {
+                if (writerError == null) writerError = asIO(ex);
+            }
+        }
+
+        private static IOException asIO(Exception ex) {
+            Throwable cause = (ex instanceof java.util.concurrent.ExecutionException && ex.getCause() != null)
+                    ? ex.getCause() : ex;
+            return (cause instanceof IOException) ? (IOException) cause : new IOException(cause);
+        }
+    }
+
     static final class Compressed {
         final Entry e;
         final byte[] data;         // in-memory payload, or null when streamed
@@ -93,98 +304,6 @@ public final class ParallelZipWriter {
             this.e = e; this.data = data; this.streamFrom = streamFrom; this.streamIsTemp = streamIsTemp;
             this.crc = crc; this.rawSize = rawSize; this.compSize = compSize; this.method = method;
         }
-    }
-
-    /** Public entry point used by the Gradle task. */
-    public static Result write(List<Source> sources, Path out, boolean store, int level,
-                               int threads, boolean preserveTimestamps)
-            throws IOException, InterruptedException {
-        return write(sources, out, store, level, threads, preserveTimestamps, false, SPILL_THRESHOLD);
-    }
-
-    /** Test overload: force ZIP64 encoding regardless of size. */
-    static Result write(List<Source> sources, Path out, boolean store, int level,
-                        int threads, boolean preserveTimestamps, boolean forceZip64)
-            throws IOException, InterruptedException {
-        return write(sources, out, store, level, threads, preserveTimestamps, forceZip64, SPILL_THRESHOLD);
-    }
-
-    /**
-     * @param forceZip64     test hook: emit ZIP64 records/extra fields even when values fit.
-     * @param spillThreshold entries larger than this are streamed; tests pass a small value
-     *                       to force the streaming path without huge inputs.
-     */
-    static Result write(List<Source> sources, Path out, boolean store, int level,
-                        int threads, boolean preserveTimestamps, boolean forceZip64, long spillThreshold)
-            throws IOException, InterruptedException {
-
-        long t0 = System.nanoTime();
-        List<Entry> entries = enumerate(sources, preserveTimestamps);
-        long tEnum = System.nanoTime();
-
-        Path outAbs = out.toAbsolutePath();
-        Files.createDirectories(outAbs.getParent());
-        Path spillDir = Files.createTempDirectory(outAbs.getParent(), ".pzip-");
-
-        ExecutorService pool = Executors.newFixedThreadPool(threads);
-        ThreadLocal<Deflater> deflaters = ThreadLocal.withInitial(() -> new Deflater(level, true));
-        Semaphore inFlight = new Semaphore(threads * 4);
-        BlockingQueue<Future<Compressed>> queue = new ArrayBlockingQueue<>(threads * 4 + 1);
-
-        long[] stats = new long[2]; // raw, stored
-        final long[] archiveSize = {0};
-        final boolean[] usedZip64 = {false};
-        final IOException[] writerError = {null};
-
-        Thread writer = new Thread(() -> {
-            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out), 1 << 20)) {
-                List<Entry> order = new ArrayList<>(entries.size());
-                List<long[]> meta = new ArrayList<>(entries.size()); // crc, comp, raw, method, offset
-                long offset = 0;
-                while (true) {
-                    Future<Compressed> f = queue.take();
-                    if (f == POISON) break;
-                    Compressed c = f.get();
-                    inFlight.release();
-                    long localOffset = offset;
-                    byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
-                    os.write(lh);
-                    writePayload(os, c);
-                    offset += lh.length + c.compSize;
-                    order.add(c.e);
-                    meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
-                    stats[0] += c.rawSize; stats[1] += c.compSize;
-                }
-                byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
-                os.write(tail);
-                archiveSize[0] = offset + tail.length;
-            } catch (IOException ex) {
-                writerError[0] = ex;
-            } catch (Exception ex) {
-                writerError[0] = new IOException(ex);
-            }
-        }, "parallel-zip-writer");
-        writer.start();
-
-        try {
-            for (Entry e : entries) {
-                inFlight.acquire();
-                Future<Compressed> fut = pool.submit(() -> compress(e, store, level, deflaters.get(), spillThreshold, spillDir));
-                queue.put(fut);
-            }
-            queue.put(POISON);
-            writer.join();
-        } finally {
-            pool.shutdown();
-            deleteRecursively(spillDir);
-        }
-
-        if (writerError[0] != null) {
-            throw writerError[0];
-        }
-        long tEnd = System.nanoTime();
-        return new Result(archiveSize[0], entries.size(), stats[0], stats[1],
-                (tEnum - t0) / 1_000_000L, (tEnd - tEnum) / 1_000_000L, usedZip64[0]);
     }
 
     private static void writePayload(OutputStream os, Compressed c) throws IOException {
@@ -210,48 +329,64 @@ public final class ParallelZipWriter {
                                        long spillThreshold, Path spillDir) {
         try {
             if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
+            if (e.inline != null) {
+                return compressBytes(e, e.inline, store, def);
+            }
             if (e.size > spillThreshold) {
                 return compressLarge(e, store, level, spillDir);
             }
-            byte[] raw = Files.readAllBytes(e.file);
-            CRC32 crc = new CRC32();
-            crc.update(raw);
-            if (store || raw.length == 0) {
-                return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
-            }
-            def.reset();
-            def.setInput(raw);
-            def.finish();
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(64, raw.length / 2));
-            byte[] tmp = new byte[STREAM_BUF];
-            while (!def.finished()) {
-                int n = def.deflate(tmp);
-                bos.write(tmp, 0, n);
-            }
-            byte[] comp = bos.toByteArray();
-            if (comp.length >= raw.length) { // deflate didn't help: store this entry
-                return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
-            }
-            return new Compressed(e, comp, null, false, crc.getValue(), raw.length, comp.length, 8);
+            return compressBytes(e, Files.readAllBytes(e.file), store, def);
         } catch (IOException ex) {
             throw new RuntimeException("Failed to compress " + e.name, ex);
         }
     }
 
-    /** Streams a large entry: deflate to a temp file, or (when stored / not helped) read from source. */
+    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def) {
+        CRC32 crc = new CRC32();
+        crc.update(raw);
+        if (store || raw.length == 0) {
+            return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
+        }
+        def.reset();
+        def.setInput(raw);
+        def.finish();
+        // Pre-size to the raw length (deflate output is at most ~raw + a few bytes for
+        // incompressible data) so the buffer never doubles, and expose it directly instead
+        // of copying via toByteArray() -- Compressed writes only compSize bytes anyway.
+        GrowBuffer bos = new GrowBuffer(raw.length + (raw.length >> 10) + 64);
+        byte[] tmp = new byte[STREAM_BUF];
+        while (!def.finished()) {
+            int n = def.deflate(tmp);
+            bos.write(tmp, 0, n);
+        }
+        int compLen = bos.size();
+        if (compLen >= raw.length) { // deflate didn't help: store this entry
+            return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
+        }
+        // data may be longer than compLen; Compressed writes exactly compSize bytes.
+        return new Compressed(e, bos.raw(), null, false, crc.getValue(), raw.length, compLen, 8);
+    }
+
+    /** A ByteArrayOutputStream that exposes its backing array to avoid a trimming copy. */
+    private static final class GrowBuffer extends ByteArrayOutputStream {
+        GrowBuffer(int cap) { super(cap); }
+        byte[] raw() { return buf; }
+    }
+
+    /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
     private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir) throws IOException {
         CRC32 crc = new CRC32();
         if (store) {
             crcOf(e.file, crc);
-            // Stream the source itself; nothing is copied.
-            return new Compressed(e, null, e.file, false, crc.getValue(), e.size, e.size, 0);
+            return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
         Path tmp = Files.createTempFile(spillDir, "e", ".z");
         long compSize = deflateToFile(e.file, tmp, level, crc);
-        if (compSize >= e.size) { // deflate didn't help: drop temp, stream the source stored
+        if (compSize >= e.size) { // deflate didn't help: stream the input as STORE
             Files.deleteIfExists(tmp);
-            return new Compressed(e, null, e.file, false, crc.getValue(), e.size, e.size, 0);
+            return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
+        if (e.fileIsTemp) Files.deleteIfExists(e.file); // input temp fully consumed
         return new Compressed(e, null, tmp, true, crc.getValue(), e.size, compSize, 8);
     }
 
@@ -299,25 +434,20 @@ public final class ParallelZipWriter {
             Path base = s.baseDir();
             if (!Files.exists(base)) continue;
             try (var stream = Files.walk(base)) {
-                List<Path> paths = stream.toList();
-                for (Path p : paths) {
+                for (Path p : stream.toList()) {
                     if (p.equals(base)) continue;
                     boolean dir = Files.isDirectory(p);
                     String rel = base.relativize(p).toString().replace('\\', '/');
-                    String name = prefix + rel + (dir ? "/" : "");
+                    String name = prefix + rel;
+                    if (dir) name = name + "/";
                     if (!seen.add(name)) continue; // first one wins on duplicates
-                    Entry e = new Entry();
-                    e.dir = dir;
-                    e.name = name;
-                    e.nameBytes = name.getBytes(StandardCharsets.UTF_8);
-                    e.file = dir ? null : p;
-                    e.size = dir ? 0 : Files.size(p);
                     int[] dt = preserveTimestamps
                             ? dosDateTime(Files.getLastModifiedTime(p).toMillis())
                             : new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
-                    e.dosTime = dt[0];
-                    e.dosDate = dt[1];
-                    list.add(e);
+                    int extAttr = dir ? 0x10 : 0;
+                    list.add(dir
+                            ? dirEntry(name, dt[0], dt[1], extAttr)
+                            : fileEntry(name, p, false, Files.size(p), dt[0], dt[1], extAttr));
                 }
             }
         }
@@ -396,7 +526,7 @@ public final class ParallelZipWriter {
             b.putShort((short) 0);                 // comment length
             b.putShort((short) 0);                 // disk number start
             b.putShort((short) 0);                 // internal attrs
-            b.putInt(e.dir ? 0x10 : 0);            // external attrs
+            b.putInt(e.externalAttr);              // external attrs
             b.putInt((int) (z64off ? MAX32 : off));
             b.put(e.nameBytes);
             if (z64) {
@@ -416,7 +546,6 @@ public final class ParallelZipWriter {
 
         if (needZip64) {
             long eocd64Offset = cdOffset + cdSize;
-            // ZIP64 end of central directory record.
             b.putInt(EOCD64_SIG);
             b.putLong(44);                         // size of remaining record
             b.putShort((short) 45);                // version made by
@@ -427,14 +556,12 @@ public final class ParallelZipWriter {
             b.putLong(count);                      // total entries
             b.putLong(cdSize);
             b.putLong(cdOffset);
-            // ZIP64 end of central directory locator.
             b.putInt(EOCD64_LOC_SIG);
             b.putInt(0);                           // disk with ZIP64 EOCD
             b.putLong(eocd64Offset);
             b.putInt(1);                           // total number of disks
         }
 
-        // Regular end of central directory record (sentinels when values overflow).
         b.putInt(EOCD_SIG);
         b.putShort((short) 0);
         b.putShort((short) 0);
@@ -450,7 +577,7 @@ public final class ParallelZipWriter {
         return out;
     }
 
-    private static int[] dosDateTime(long millis) {
+    public static int[] dosDateTime(long millis) {
         java.util.Calendar c = java.util.Calendar.getInstance();
         c.setTimeInMillis(millis);
         int year = c.get(java.util.Calendar.YEAR);
@@ -460,7 +587,7 @@ public final class ParallelZipWriter {
         return new int[]{time, date};
     }
 
-    private static void deleteRecursively(Path root) {
+    static void deleteRecursively(Path root) {
         if (root == null) return;
         try (var s = Files.walk(root)) {
             s.sorted(Comparator.reverseOrder()).forEach(p -> {
@@ -469,7 +596,6 @@ public final class ParallelZipWriter {
         } catch (IOException ignored) { }
     }
 
-    // Sentinel marking the end of the work queue.
     static final Future<Compressed> POISON = new Future<>() {
         public boolean cancel(boolean i) { return false; }
         public boolean isCancelled() { return false; }

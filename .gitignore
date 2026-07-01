@@ -5,3 +5,6 @@ build/
 *.iml
 .vscode/
 out/
+
+# JVM heap dumps (e.g. from OOM during tests)
+*.hprof

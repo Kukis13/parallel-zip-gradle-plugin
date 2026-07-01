@@ -5,9 +5,9 @@ import org.gradle.testkit.runner.GradleRunner;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -17,6 +17,9 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ParallelZipFunctionalTest {
@@ -24,22 +27,28 @@ class ParallelZipFunctionalTest {
     @TempDir
     Path projectDir;
 
-    private void writeProject(String taskBody) throws IOException {
+    private void settings() throws IOException {
         Files.writeString(projectDir.resolve("settings.gradle"), "rootProject.name = 'sample'\n");
+    }
+
+    private void buildFile(String taskBody) throws IOException {
         Files.writeString(projectDir.resolve("build.gradle"), """
                 plugins { id 'io.github.kukis13.parallel-zip' }
                 import io.github.kukis13.parallelzip.ParallelZip
+                import org.apache.tools.ant.filters.ReplaceTokens
                 tasks.register('dist', ParallelZip) {
+                    destinationDirectory = layout.buildDirectory
+                    archiveFileName = 'dist.zip'
                 %s
                 }
                 """.formatted(taskBody));
+    }
 
-        // A small but varied source tree: compressible text, nested dirs, an "already
-        // compressed" blob, and an empty file.
+    private void sampleTree() throws IOException {
         Path src = projectDir.resolve("staging");
         Files.createDirectories(src.resolve("a/b/c"));
         Files.writeString(src.resolve("a/hello.txt"), "hello ".repeat(1000));
-        Files.writeString(src.resolve("a/b/c/deep.txt"), "deep content\n".repeat(200));
+        Files.writeString(src.resolve("a/b/c/deep.txt"), "deep\n".repeat(200));
         Files.writeString(src.resolve("readme.md"), "# sample\n");
         Files.write(src.resolve("a/b/blob.bin"), randomish(50_000));
         Files.createFile(src.resolve("a/empty"));
@@ -60,6 +69,10 @@ class ParallelZipFunctionalTest {
                 .build();
     }
 
+    private Path archive() {
+        return projectDir.resolve("build/dist.zip");
+    }
+
     private long verifyAllEntries(Path zip) throws IOException {
         long files = 0;
         byte[] buf = new byte[8192];
@@ -69,13 +82,22 @@ class ParallelZipFunctionalTest {
                 ZipEntry e = en.nextElement();
                 if (e.isDirectory()) continue;
                 files++;
-                // Reading validates the CRC; a corrupt entry throws here.
-                try (InputStream in = zf.getInputStream(e)) {
-                    while (in.read(buf) >= 0) { /* drain */ }
-                }
+                try (InputStream in = zf.getInputStream(e)) { while (in.read(buf) >= 0) { } } // CRC check
             }
         }
         return files;
+    }
+
+    private String readEntry(Path zip, String name) throws IOException {
+        try (ZipFile zf = new ZipFile(zip.toFile())) {
+            ZipEntry e = zf.getEntry(name);
+            assertNotNull(e, "missing entry: " + name);
+            try (InputStream in = zf.getInputStream(e)) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                in.transferTo(bos);
+                return bos.toString();
+            }
+        }
     }
 
     private String sha256(Path p) throws Exception {
@@ -86,52 +108,80 @@ class ParallelZipFunctionalTest {
 
     @Test
     void deflateProducesValidArchive() throws Exception {
-        writeProject("    from = layout.projectDirectory.dir('staging')\n"
-                + "    archiveFile = layout.buildDirectory.file('dist.zip')\n"
-                + "    threads = 4\n");
+        settings();
+        sampleTree();
+        buildFile("    from 'staging'\n    threads = 4\n");
         BuildResult result = run("dist");
-        assertTrue(result.getOutput().contains("ParallelZip ->"), result.getOutput());
-        Path zip = projectDir.resolve("build/dist.zip");
-        assertTrue(Files.exists(zip));
-        assertEquals(5, verifyAllEntries(zip)); // 5 files in the source tree
+        assertTrue(result.getOutput().contains("BUILD SUCCESSFUL"));
+        assertEquals(5, verifyAllEntries(archive()));
     }
 
     @Test
     void storeProducesValidArchive() throws Exception {
-        writeProject("    from = layout.projectDirectory.dir('staging')\n"
-                + "    archiveFile = layout.buildDirectory.file('dist.zip')\n"
-                + "    store = true\n");
+        settings();
+        sampleTree();
+        buildFile("    from 'staging'\n    store = true\n");
         run("dist");
-        assertEquals(5, verifyAllEntries(projectDir.resolve("build/dist.zip")));
+        assertEquals(5, verifyAllEntries(archive()));
     }
 
     @Test
     void reproducibleAcrossThreadCountsAndRuns() throws Exception {
-        // preserveTimestamps = false -> bytes must not depend on mtime or scheduling.
-        writeProject("    from = layout.projectDirectory.dir('staging')\n"
-                + "    archiveFile = layout.buildDirectory.file('dist.zip')\n"
-                + "    preserveTimestamps = false\n"
-                + "    threads = providers.gradleProperty('t').map { it as Integer }.orElse(8)\n");
-
+        settings();
+        sampleTree();
+        buildFile("""
+                    from 'staging'
+                    preserveFileTimestamps = false
+                    reproducibleFileOrder = true
+                    threads = providers.gradleProperty('t').map { it as Integer }.orElse(8)
+                """);
         run("dist", "-Pt=8", "--rerun-tasks");
-        String shaA = sha256(projectDir.resolve("build/dist.zip"));
+        String shaA = sha256(archive());
         run("dist", "-Pt=1", "--rerun-tasks");
-        String shaB = sha256(projectDir.resolve("build/dist.zip"));
+        String shaB = sha256(archive());
         run("dist", "-Pt=12", "--rerun-tasks");
-        String shaC = sha256(projectDir.resolve("build/dist.zip"));
-
+        String shaC = sha256(archive());
         assertEquals(shaA, shaB, "SHA must not depend on thread count");
         assertEquals(shaA, shaC, "SHA must not depend on thread count");
     }
 
     @Test
-    void intoPrefixIsApplied() throws Exception {
-        writeProject("    from = layout.projectDirectory.dir('staging')\n"
-                + "    into = 'myapp-1.0'\n"
-                + "    archiveFile = layout.buildDirectory.file('dist.zip')\n");
+    void supportsFullCopySpecDsl() throws Exception {
+        settings();
+        Path src = projectDir.resolve("staging");
+        Files.createDirectories(src);
+        Files.writeString(src.resolve("readme.md"), "# hi\n");
+        Files.writeString(src.resolve("hello.txt"), "hello\n");
+        Files.writeString(src.resolve("debug.log"), "noise\n");
+        Path conf = projectDir.resolve("conf");
+        Files.createDirectories(conf);
+        Files.writeString(conf.resolve("app.properties"), "version=@version@\n");
+
+        // Nested into, exclude, rename, filter (token replacement) — the real drop-in features.
+        buildFile("""
+                    into('app') {
+                        from('staging') {
+                            exclude '**/*.log'
+                            rename 'readme.md', 'README.txt'
+                        }
+                    }
+                    into('app/conf') {
+                        from('conf') {
+                            filter(ReplaceTokens, tokens: [version: '1.2.3'])
+                        }
+                    }
+                """);
         run("dist");
-        try (ZipFile zf = new ZipFile(projectDir.resolve("build/dist.zip").toFile())) {
-            assertTrue(zf.getEntry("myapp-1.0/readme.md") != null, "prefix should be applied to entries");
+
+        Path zip = archive();
+        try (ZipFile zf = new ZipFile(zip.toFile())) {
+            assertNotNull(zf.getEntry("app/README.txt"), "rename applied");
+            assertNotNull(zf.getEntry("app/hello.txt"), "into prefix applied");
+            assertNull(zf.getEntry("app/debug.log"), "exclude applied");
+            assertNull(zf.getEntry("app/readme.md"), "old name gone after rename");
         }
+        String props = readEntry(zip, "app/conf/app.properties");
+        assertTrue(props.contains("version=1.2.3"), "filter replaced token: " + props);
+        assertFalse(props.contains("@version@"), "token should be gone");
     }
 }
