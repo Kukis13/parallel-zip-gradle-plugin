@@ -4,15 +4,19 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -47,14 +51,42 @@ class ParallelZipWriterStreamingTest {
     }
 
     @Test
-    void streamedDeflateIsByteIdenticalToInMemory() throws Exception {
+    void streamedDeflateDecodesIdenticallyToInMemory() throws Exception {
+        // Not byte-identical: the in-memory path may use the native libdeflate
+        // codec (when bundled/available) while the streamed path always uses the
+        // JDK Deflater, since libdeflate has no streaming API. Both are valid,
+        // independently-decodable DEFLATE encoders of the same input, so the
+        // invariant that must hold is decoded-content equality, not raw bytes.
         Path src = sampleTree();
         Path inMem = tmp.resolve("inmem.zip");
         Path streamed = tmp.resolve("streamed.zip");
         write(src, inMem, false, Long.MAX_VALUE); // never spills
         write(src, streamed, false, 0);           // every non-empty entry streams
-        assertEquals(-1L, Files.mismatch(inMem, streamed),
-                "streamed DEFLATE output must be byte-identical to in-memory output");
+        assertSameDecodedContents(inMem, streamed);
+    }
+
+    private static void assertSameDecodedContents(Path zipA, Path zipB) throws IOException {
+        Map<String, byte[]> a = readAllEntries(zipA);
+        Map<String, byte[]> b = readAllEntries(zipB);
+        assertEquals(a.keySet(), b.keySet());
+        for (String name : a.keySet()) {
+            assertArrayEquals(a.get(name), b.get(name), "content mismatch for entry " + name);
+        }
+    }
+
+    private static Map<String, byte[]> readAllEntries(Path zip) throws IOException {
+        Map<String, byte[]> out = new LinkedHashMap<>();
+        try (ZipFile zf = new ZipFile(zip.toFile())) {
+            var en = zf.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                if (e.isDirectory()) continue;
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                try (InputStream in = zf.getInputStream(e)) { in.transferTo(bos); }
+                out.put(e.getName(), bos.toByteArray());
+            }
+        }
+        return out;
     }
 
     @Test

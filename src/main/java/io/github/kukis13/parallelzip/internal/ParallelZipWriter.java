@@ -330,22 +330,27 @@ public final class ParallelZipWriter {
         try {
             if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
             if (e.inline != null) {
-                return compressBytes(e, e.inline, store, def);
+                return compressBytes(e, e.inline, store, level, def);
             }
             if (e.size > spillThreshold) {
                 return compressLarge(e, store, level, spillDir);
             }
-            return compressBytes(e, Files.readAllBytes(e.file), store, def);
+            return compressBytes(e, Files.readAllBytes(e.file), store, level, def);
         } catch (IOException ex) {
             throw new RuntimeException("Failed to compress " + e.name, ex);
         }
     }
 
-    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def) {
+    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, int level, Deflater def) {
         CRC32 crc = new CRC32();
         crc.update(raw);
         if (store || raw.length == 0) {
             return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
+        }
+        if (LibdeflateNative.available()) {
+            Compressed viaNative = tryNativeDeflate(e, raw, level, crc.getValue());
+            if (viaNative != null) return viaNative;
+            // fell through: native call failed for some reason, use the JDK path below
         }
         def.reset();
         def.setInput(raw);
@@ -365,6 +370,19 @@ public final class ParallelZipWriter {
         }
         // data may be longer than compLen; Compressed writes exactly compSize bytes.
         return new Compressed(e, bos.raw(), null, false, crc.getValue(), raw.length, compLen, 8);
+    }
+
+    /** Returns null (caller falls back to the JDK Deflater) if the native call fails for any reason. */
+    private static Compressed tryNativeDeflate(Entry e, byte[] raw, int level, long crcValue) {
+        int nativeLevel = level < 0 ? 6 : level; // -1 sentinel means "zlib default"
+        int cap = raw.length + (raw.length >> 12) + 64;
+        byte[] out = new byte[cap];
+        int n = LibdeflateNative.compress(raw, 0, raw.length, out, 0, cap, nativeLevel);
+        if (n <= 0) return null;
+        if (n >= raw.length) { // deflate didn't help: store this entry
+            return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);
+        }
+        return new Compressed(e, out, null, false, crcValue, raw.length, n, 8);
     }
 
     /** A ByteArrayOutputStream that exposes its backing array to avoid a trimming copy. */
