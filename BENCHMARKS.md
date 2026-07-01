@@ -28,3 +28,21 @@ default. The one exception is Groovy: many small, already-cheap-to-compress file
 per-entry pipeline overhead outweighs the compression saved — the only corpus here where
 DEFLATE is slower than single-threaded `Zip`. Use `store = true` only for archives you
 already know are jar/binary-heavy, where STORE's size cost is small and the speedup large.
+
+## Small-entry batching (1.1.0+)
+
+The table above predates 1.1.0, which batches small entries into fewer compression
+tasks (see [Options](README.md#options)) to cut per-task scheduling overhead. Spot-checked
+on four of the projects above, comparing 1.1.0 against 1.0.0 under identical conditions:
+
+| Project | Files | 1.0.0 DEFLATE speedup | 1.1.0 DEFLATE speedup | Change |
+|---|--:|--:|--:|--:|
+| ZooKeeper 3.9.3 | 1,632 | 3.02× | 3.36× | +23% faster |
+| Gradle 8.14.3 | 22,427 | 1.96× | 2.16× | +10% faster |
+| Groovy 4.0.24 | 9,756 | 0.857× (slower) | 0.890× (slower) | +3.2% faster, still net slower |
+| SonarQube Community Build 26.6 | 749 | 3.15× | 3.16× | neutral |
+
+Batching helps in proportion to how many small entries there are to amortize scheduling
+overhead across, and is a no-op where there aren't many (SonarQube: few, large files).
+It narrows Groovy's regression without eliminating it — some many-small-file corpora are
+still net slower than single-threaded `Zip`.

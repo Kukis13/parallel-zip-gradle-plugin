@@ -28,7 +28,7 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'io.github.kukis13.parallel-zip' version '1.0.0'
+    id 'io.github.kukis13.parallel-zip' version '1.1.0'
 }
 
 tasks.register('dist', io.github.kukis13.parallelzip.ParallelZip) {
@@ -74,6 +74,11 @@ On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled nat
 so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or any
 failure loading the native build, falls back to the pure-Java path automatically.
 
+Small entries are also batched into fewer compression tasks, amortizing per-task
+scheduling overhead across many small files — a real win on archives with lots of
+small entries (spot-checked up to +23% faster), and a no-op elsewhere. This is always
+on; there's no configuration for it.
+
 ## Benchmarks
 
 A few highlights from real open-source projects — full 11-project table and methodology
@@ -105,9 +110,6 @@ unaffected either way.
 
 ## Roadmap
 
-- Batch small entries into fewer compression work-units, to cut the per-entry pipeline
-  overhead that currently makes DEFLATE slower than baseline on many-small-file corpora
-  (see Groovy in [BENCHMARKS.md](BENCHMARKS.md)).
 - Optional per-entry parallel *reads* for filter-free specs (skip materialization).
 - Zero-copy (mmap) reads for large entries, feeding the native accelerator directly
   instead of copying through a JVM byte array.

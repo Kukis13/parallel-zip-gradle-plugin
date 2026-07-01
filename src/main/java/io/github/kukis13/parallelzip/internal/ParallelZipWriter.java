@@ -190,8 +190,19 @@ public final class ParallelZipWriter {
         private int entryCount;
         private volatile IOException writerError;
 
+        // Small entries are batched into one compression task instead of one-per-entry:
+        // many-small-file archives (e.g. a tree of .class files) can spend more time on
+        // per-task scheduling (queue/semaphore/Future overhead) than on the compression
+        // itself. Batching amortizes that overhead across up to BATCH_MAX_ENTRIES entries
+        // without changing what gets compressed or the order entries are written in.
+        private static final long BATCHABLE_MAX_ENTRY_BYTES = 64L << 10;  // 64 KiB
+        private static final int BATCH_MAX_ENTRIES = 256;
+        private static final long BATCH_MAX_BYTES = 4L << 20;             // 4 MiB combined
+        private final List<Entry> pendingBatch = new ArrayList<>();
+        private long pendingBatchBytes;
+
         /** A submitted future together with the byte-budget permits it holds. */
-        private record Item(Future<Compressed> future, int permits) {}
+        private record Item(Future<List<Compressed>> future, int permits) {}
         private static final Item POISON_ITEM = new Item(null, 0);
 
         public Sink(Path out, boolean store, int level, int threads,
@@ -213,18 +224,55 @@ public final class ParallelZipWriter {
         }
 
         public void add(Entry e) throws InterruptedException {
-            int permits = permitsFor(e);
-            byteFlight.acquire(permits);   // backpressure on memory; released by the writer
+            if (isBatchable(e)) {
+                pendingBatch.add(e);
+                pendingBatchBytes += e.size;
+                if (pendingBatch.size() >= BATCH_MAX_ENTRIES || pendingBatchBytes >= BATCH_MAX_BYTES) {
+                    flushBatch();
+                }
+                return;
+            }
+            // Flush first: any already-buffered small entries must reach the writer's
+            // queue before this one, or their relative order in the archive would break.
+            flushBatch();
+            submit(List.of(e));
+        }
+
+        /** Directories and streamed (large) entries stay as their own submitted unit. */
+        private boolean isBatchable(Entry e) {
+            return !e.dir && e.size <= BATCHABLE_MAX_ENTRY_BYTES;
+        }
+
+        private void flushBatch() throws InterruptedException {
+            if (pendingBatch.isEmpty()) return;
+            List<Entry> batch = new ArrayList<>(pendingBatch);
+            pendingBatch.clear();
+            pendingBatchBytes = 0;
+            submit(batch);
+        }
+
+        private void submit(List<Entry> batch) throws InterruptedException {
+            int permits = permitsForBatch(batch);
+            byteFlight.acquire(permits);  // backpressure on memory; released by the writer
             countFlight.acquire();
-            Future<Compressed> f = pool.submit(() -> compress(e, store, level, deflaters.get(), spillThreshold, spillDir));
+            Future<List<Compressed>> f =
+                    pool.submit(() -> compressBatch(batch, store, level, deflaters.get(), spillThreshold, spillDir));
             queue.put(new Item(f, permits));
         }
 
         /**
-         * Heap a not-yet-written entry costs, in MiB permits. A DEFLATE entry holds the raw
+         * Heap a not-yet-written batch costs, in MiB permits. A DEFLATE entry holds the raw
          * bytes AND the compressed buffer at once (~2x), a STORE entry only the raw bytes,
          * and a streamed (large) entry ~nothing. Kept conservative to avoid OOM on small heaps.
          */
+        private int permitsForBatch(List<Entry> batch) {
+            if (batch.size() == 1) return permitsFor(batch.get(0));
+            long mem = 0;
+            for (Entry e : batch) mem += e.size; // isBatchable guarantees these are all in-memory-sized
+            if (!store) mem *= 2; // raw + compressed buffer resident together
+            return (int) Math.max(1, Math.min(budgetMiB, (mem + MIB - 1) / MIB));
+        }
+
         private int permitsFor(Entry e) {
             long mem;
             if (e.inline != null) mem = e.size;
@@ -236,6 +284,7 @@ public final class ParallelZipWriter {
 
         public Result finish() throws IOException, InterruptedException {
             try {
+                flushBatch();
                 queue.put(POISON_ITEM);
                 writerThread.join();
             } finally {
@@ -255,24 +304,26 @@ public final class ParallelZipWriter {
                 while (true) {
                     Item item = queue.take();
                     if (item == POISON_ITEM) break;
-                    Compressed c = null;
+                    List<Compressed> results = null;
                     try {
-                        c = item.future().get();
+                        results = item.future().get();
                     } catch (Exception ex) {
                         if (writerError == null) writerError = asIO(ex);
                         failed = true;
                     }
                     countFlight.release();               // always release to avoid producer deadlock
                     byteFlight.release(item.permits());
-                    if (failed || c == null) continue;   // keep draining the queue
-                    long localOffset = offset;
-                    byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
-                    os.write(lh);
-                    writePayload(os, c);
-                    offset += lh.length + c.compSize;
-                    order.add(c.e);
-                    meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
-                    stats[0] += c.rawSize; stats[1] += c.compSize;
+                    if (failed || results == null) continue;   // keep draining the queue
+                    for (Compressed c : results) {
+                        long localOffset = offset;
+                        byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
+                        os.write(lh);
+                        writePayload(os, c);
+                        offset += lh.length + c.compSize;
+                        order.add(c.e);
+                        meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
+                        stats[0] += c.rawSize; stats[1] += c.compSize;
+                    }
                 }
                 if (!failed) {
                     byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
@@ -323,6 +374,16 @@ public final class ParallelZipWriter {
         } finally {
             if (c.streamIsTemp) Files.deleteIfExists(c.streamFrom);
         }
+    }
+
+    /** Compresses each entry in the batch in turn, on one submitted task. */
+    private static List<Compressed> compressBatch(List<Entry> batch, boolean store, int level, Deflater def,
+                                                  long spillThreshold, Path spillDir) {
+        List<Compressed> out = new ArrayList<>(batch.size());
+        for (Entry e : batch) {
+            out.add(compress(e, store, level, def, spillThreshold, spillDir));
+        }
+        return out;
     }
 
     private static Compressed compress(Entry e, boolean store, int level, Deflater def,
@@ -613,12 +674,4 @@ public final class ParallelZipWriter {
             });
         } catch (IOException ignored) { }
     }
-
-    static final Future<Compressed> POISON = new Future<>() {
-        public boolean cancel(boolean i) { return false; }
-        public boolean isCancelled() { return false; }
-        public boolean isDone() { return true; }
-        public Compressed get() { return null; }
-        public Compressed get(long t, java.util.concurrent.TimeUnit u) { return null; }
-    };
 }
