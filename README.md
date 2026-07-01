@@ -9,8 +9,7 @@ distributions that makes archiving one of the slowest tasks in the build.
 `parallel-zip` is a small, dependency-free custom task that compresses entries across
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
 **byte-for-byte reproducible** archive. It extends `AbstractArchiveTask`, so it's a
-**drop-in for `Zip`** — the full `CopySpec` DSL works unchanged. See
-[Limitations](#limitations).
+**drop-in for `Zip`** — the full `CopySpec` DSL works unchanged.
 
 ## Why
 
@@ -114,12 +113,6 @@ Compression runs in parallel but entries are always written in a fixed order (Gr
 resolved copy order, honouring `reproducibleFileOrder`), so scheduling never affects the
 bytes. For fully reproducible builds also ensure identical file **contents** and the same
 **JDK** (the DEFLATE codec must match); `store = true` sidesteps the codec dependency.
-
-## Limitations
-
-- No symlink preservation yet (POSIX file permissions **are** carried through).
-- `duplicatesStrategy`, `reproducibleFileOrder`, and content filters are honoured via
-  Gradle's standard copy pipeline.
 
 ## Roadmap
 
