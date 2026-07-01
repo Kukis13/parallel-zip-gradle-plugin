@@ -8,12 +8,9 @@ distributions that makes archiving one of the slowest tasks in the build.
 
 `parallel-zip` is a small, dependency-free custom task that compresses entries across
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
-**byte-for-byte reproducible** archive.
-
-> Status: early (`0.4.0`). It extends `AbstractArchiveTask`, so it's a **drop-in for
-> `Zip`** — the full `CopySpec` DSL works unchanged. Tested for validity, reproducibility,
-> ZIP64 (> 4 GiB, > 65,535 entries), and streamed entries > 2 GiB, and cross-validated
-> against a non-Java reader on a real ~927 MiB distribution. See [Limitations](#limitations).
+**byte-for-byte reproducible** archive. It extends `AbstractArchiveTask`, so it's a
+**drop-in for `Zip`** — the full `CopySpec` DSL works unchanged. See
+[Limitations](#limitations).
 
 ## Why
 
@@ -32,7 +29,7 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'io.github.kukis13.parallel-zip' version '0.4.0'
+    id 'io.github.kukis13.parallel-zip' version '1.0.0'
 }
 
 tasks.register('dist', io.github.kukis13.parallelzip.ParallelZip) {
@@ -67,34 +64,16 @@ Everything on `Zip`/`AbstractArchiveTask` applies (`from`, `into`, `include`, `e
 
 Per-entry safety net: if DEFLATE would make an entry *larger* (already-compressed data),
 that entry is automatically STORED instead, so output is never bigger than necessary.
+Archives beyond the standard ZIP limits — over 4 GiB, over 65,535 entries, or per-entry
+offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields and end-of-central-directory
+records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
 ## Benchmarks
 
-Measured on the **SonarQube** distribution archive (`:sonar-application:zip`): 610 files,
-~927 MiB raw, ~99% of bytes already compressed (jars + JRE archives). Machine: 12 logical
-cores, JDK 21, warm file cache.
-
-| Approach | Time | Archive size | Notes |
-|---|---|---|---|
-| Gradle `Zip` (DEFLATE, baseline) | **~23 s** | 863 MiB | single-threaded |
-| Gradle `Zip` (`entryCompression = STORED`) | ~2.9 s | 927 MiB | single-threaded |
-| **parallel-zip, DEFLATE, 12 threads** | **~4.9 s** | 863 MiB | **same size as baseline**, ~5× faster |
-| **parallel-zip, STORE, 12 threads** | **~0.7 s** | 927 MiB | ~30× faster, +7.4% size |
-
-DEFLATE scaling (CPU-bound, so it parallelizes well): 1 thread ≈ 26 s → 4 threads ≈ 8.7 s
-→ 12 threads ≈ 4.9 s.
-
-STORE is I/O-bound on a warm cache, so a single thread already saturates the write path;
-its win comes from skipping compression, not from threads.
-
-### Across other popular open-source projects
-
-To check this isn't a SonarQube-specific fluke, the same methodology was repeated against
-the official binary distributions of eight more popular OSS projects: extract the
-distribution, then archive the identical directory tree three ways — Gradle `Zip`
-(DEFLATE, baseline), `parallel-zip` DEFLATE (same 12 threads, byte-identical output), and
-`parallel-zip` STORE. Same machine, JDK 21, 12 logical cores, warm cache, `--profile`
-per-task timings.
+Measured across the official binary distributions of ten popular open-source Java
+projects: extract the distribution, then archive the identical directory tree three ways
+— Gradle `Zip` (DEFLATE, baseline), `parallel-zip` DEFLATE (byte-identical output), and
+`parallel-zip` STORE. Same machine throughout: 12 logical cores, JDK 21, warm file cache.
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|
@@ -107,16 +86,15 @@ per-task timings.
 | Spark 3.5.3 | 1,825 | 427.9 MiB | 9.11 s | 4.63 s (**2.0×**) | 1.10 s (**8.3×**) | +10.4% |
 | Gradle 8.14.3 | 22,432 | 500.2 MiB | 9.56 s | 5.19 s (**1.8×**) | 3.64 s (**2.6×**) | +108.6% |
 | Flink 1.20.0 | 167 | 502.8 MiB | 10.66 s | 5.47 s (**1.9×**) | 1.06 s (**10.1×**) | +8.9% |
-| SonarQube (above) | 610 | 927 MiB | 23 s | 4.9 s (**4.7×**) | 0.7 s (**32.9×**) | +7.4% |
+| SonarQube distribution | 610 | 927 MiB | 23 s | 4.9 s (**4.7×**) | 0.7 s (**32.9×**) | +7.4% |
 
 The DEFLATE column never produces a larger archive than the baseline (the per-entry STORE
 fallback + identical codec guarantee that), so it's a safe default. STORE trades size for
 speed, and how much size depends entirely on how compressible the content already is:
 
-- **Jar-heavy binary distributions** (Kafka, Solr, HBase, Spark, Flink, SonarQube) are
-  mostly pre-compressed bytes: DEFLATE gets **1.8–4.7×** faster and STORE gets
-  **7–33×** faster for a modest **4–22%** size increase. This is the sweet spot the
-  plugin was built for.
+- **Jar-heavy binary distributions** (most of the table above) are mostly pre-compressed
+  bytes already: DEFLATE gets **1.8–4.7×** faster and STORE gets **7–33×** faster for a
+  modest **4–22%** size increase. This is the sweet spot the plugin was built for.
 - **Corpora dominated by many small, highly-compressible files** — Groovy's tree of
   `.class`/javadoc output, or Gradle's own distribution (22k+ files) — see much smaller
   DEFLATE gains, and on Groovy the parallel pipeline's per-entry overhead (queueing,
@@ -136,22 +114,6 @@ Compression runs in parallel but entries are always written in a fixed order (Gr
 resolved copy order, honouring `reproducibleFileOrder`), so scheduling never affects the
 bytes. For fully reproducible builds also ensure identical file **contents** and the same
 **JDK** (the DEFLATE codec must match); `store = true` sidesteps the codec dependency.
-
-## Large archives (ZIP64)
-
-ZIP64 is applied automatically when needed — archives larger than 4 GiB, more than
-65,535 entries, or per-entry offsets/sizes beyond 4 GiB. The correct ZIP64 extra fields
-and end-of-central-directory records are emitted, and the output is validated against
-both `java.util.zip` and a non-Java (.NET) reader.
-
-## Memory
-
-Small entries are compressed in memory (the fast path); entries larger than ~8 MiB are
-streamed through the deflater to a temp file, so a **single entry may be arbitrarily
-large** (tested past 2 GiB). In-flight memory is bounded to a fraction of the heap, so the
-task runs within a default (512 MiB) Gradle daemon even on a ~1 GiB archive — though, like
-any parallel work, more heap (`org.gradle.jvmargs=-Xmx…`) lets more entries compress at
-once. The streamed path is byte-for-byte identical to the in-memory path.
 
 ## Limitations
 
