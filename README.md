@@ -87,6 +87,47 @@ DEFLATE scaling (CPU-bound, so it parallelizes well): 1 thread ≈ 26 s → 4 th
 STORE is I/O-bound on a warm cache, so a single thread already saturates the write path;
 its win comes from skipping compression, not from threads.
 
+### Across other popular open-source projects
+
+To check this isn't a SonarQube-specific fluke, the same methodology was repeated against
+the official binary distributions of eight more popular OSS projects: extract the
+distribution, then archive the identical directory tree three ways — Gradle `Zip`
+(DEFLATE, baseline), `parallel-zip` DEFLATE (same 12 threads, byte-identical output), and
+`parallel-zip` STORE. Same machine, JDK 21, 12 logical cores, warm cache, `--profile`
+per-task timings.
+
+| Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE | parallel-zip STORE | STORE size Δ |
+|---|--:|--:|--:|--:|--:|--:|
+| ZooKeeper 3.9.3 | 1,632 | 50.6 MiB | 0.85 s | 0.36 s (**2.4×**) | 0.24 s (**3.6×**) | +107.4% |
+| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.28 s | 0.47 s (**2.7×**) | 0.14 s (**9.3×**) | +18.6% |
+| Kafka 3.8.1 | 235 | 121.1 MiB | 2.55 s | 1.40 s (**1.8×**) | 0.29 s (**8.8×**) | +4.1% |
+| Groovy 4.0.24 | 9,757 | 271.6 MiB | 4.01 s | 4.98 s (0.8×, **slower**) | 4.45 s (0.9×, slower) | +273.6% |
+| Solr 9.7.0 | 2,091 | 308.5 MiB | 6.48 s | 2.42 s (**2.7×**) | 0.77 s (**8.5×**) | +12.4% |
+| HBase 2.6.1 | 2,588 | 404.8 MiB | 8.10 s | 2.86 s (**2.8×**) | 1.08 s (**7.5×**) | +22.4% |
+| Spark 3.5.3 | 1,825 | 427.9 MiB | 9.11 s | 4.63 s (**2.0×**) | 1.10 s (**8.3×**) | +10.4% |
+| Gradle 8.14.3 | 22,432 | 500.2 MiB | 9.56 s | 5.19 s (**1.8×**) | 3.64 s (**2.6×**) | +108.6% |
+| Flink 1.20.0 | 167 | 502.8 MiB | 10.66 s | 5.47 s (**1.9×**) | 1.06 s (**10.1×**) | +8.9% |
+| SonarQube (above) | 610 | 927 MiB | 23 s | 4.9 s (**4.7×**) | 0.7 s (**32.9×**) | +7.4% |
+
+The DEFLATE column never produces a larger archive than the baseline (the per-entry STORE
+fallback + identical codec guarantee that), so it's a safe default. STORE trades size for
+speed, and how much size depends entirely on how compressible the content already is:
+
+- **Jar-heavy binary distributions** (Kafka, Solr, HBase, Spark, Flink, SonarQube) are
+  mostly pre-compressed bytes: DEFLATE gets **1.8–4.7×** faster and STORE gets
+  **7–33×** faster for a modest **4–22%** size increase. This is the sweet spot the
+  plugin was built for.
+- **Corpora dominated by many small, highly-compressible files** — Groovy's tree of
+  `.class`/javadoc output, or Gradle's own distribution (22k+ files) — see much smaller
+  DEFLATE gains, and on Groovy the parallel pipeline's per-entry overhead (queueing,
+  semaphore handoff) actually *outweighs* the compression saved, making it slightly
+  slower than the single-threaded baseline. STORE mode is a poor fit here too: skipping
+  DEFLATE on already-cheap-to-compress, highly redundant content can more than **double**
+  the archive size.
+- **Recommendation:** default to `store = false` (DEFLATE) — it's a safe, usually-faster,
+  never-bigger drop-in. Only opt into `store = true` for archives you already know are
+  jar/binary-heavy, where the size cost is small and the speedup is large.
+
 ## Reproducibility
 
 With `preserveFileTimestamps = false`, the archive is **byte-for-byte identical** across
