@@ -6,7 +6,7 @@ plugins {
 }
 
 group = 'io.github.kukis13'
-version = '0.2.0'
+version = '0.3.0'
 
 java {
     toolchain {
@@ -51,4 +51,6 @@ testing {
 tasks.named('test') {
     // The engine spins up its own threads; give the test JVM a little headroom.
     maxHeapSize = '1g'
+    // Opt-in heavy test: ./gradlew test -Dpzip.hugeTest=true
+    systemProperty 'pzip.hugeTest', System.getProperty('pzip.hugeTest', 'false')
 }

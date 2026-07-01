@@ -8,9 +8,10 @@ distributions that makes archiving one of the slowest tasks in the build.
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
 **byte-for-byte reproducible** archive.
 
-> Status: early (`0.2.0`). The core engine is tested and produces valid, verifiable
-> archives, including ZIP64 (archives > 4 GiB and > 65,535 entries). Output is
-> cross-validated with a non-Java reader. See [Limitations](#limitations).
+> Status: early (`0.3.0`). The core engine is tested and produces valid, verifiable
+> archives, including ZIP64 (archives > 4 GiB and > 65,535 entries) and streamed
+> entries larger than 2 GiB. Output is cross-validated with a non-Java reader.
+> See [Limitations](#limitations).
 
 ## Why
 
@@ -25,7 +26,7 @@ sidesteps that blocker.
 
 ```groovy
 plugins {
-    id 'io.github.kukis13.parallel-zip' version '0.2.0'
+    id 'io.github.kukis13.parallel-zip' version '0.3.0'
 }
 
 tasks.register('dist', io.github.kukis13.parallelzip.ParallelZip) {
@@ -90,18 +91,22 @@ and end-of-central-directory records are emitted, and the output is validated ag
 both `java.util.zip` and a non-Java (.NET) reader. Deterministic order and reproducibility
 are preserved in ZIP64 mode.
 
+## Memory and large entries
+
+Small entries are compressed in memory (the fast path). Entries larger than 128 MiB are
+streamed through the deflater to a temporary file — or read straight from the source when
+stored — so heap use stays bounded and a **single entry may be arbitrarily large** (tested
+past 2 GiB). The streamed path produces byte-for-byte identical output to the in-memory
+path, so it never affects reproducibility.
+
 ## Limitations
 
-- **A single entry ≥ 2 GiB is not yet supported.** The engine reads each file into memory
-  (a Java `byte[]`), so one huge member fails fast with a clear message. Streaming large
-  entries is on the roadmap. (Many entries and multi-GiB *total* archives are fine.)
 - **Single source directory** per task (plus an `into` prefix). Full `CopySpec`
   (`from`/`include`/`exclude`/`rename`/`filter`) is on the roadmap.
 - No symlink or POSIX-permission preservation yet.
 
 ## Roadmap
 
-- Streaming compression so a single entry can exceed 2 GiB.
 - Full `CopySpec` support so it can extend `AbstractArchiveTask` as a true drop-in `Zip`.
 - Optional `AbstractArchiveTask` integration (`archiveBaseName`/`destinationDirectory`).
 - Pluggable codecs (e.g. libdeflate / zstd) for the compressible slice.
