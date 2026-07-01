@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Gradle 8 | 9](https://img.shields.io/badge/Gradle-8%20%7C%209-02303A?logo=gradle&logoColor=white)](#requirements)
 
 `parallel-zip` is a small, dependency-free custom task that compresses entries across
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
@@ -20,6 +21,13 @@ Gradle has had an open request to build archives in parallel since 2017
 partly because parallel writing breaks reproducible entry order. This plugin keeps a
 **fixed write order** so parallelism never affects the output bytes, which sidesteps
 that blocker.
+
+## Requirements
+
+Gradle 8 and Gradle 9, JDK 17+. Verified directly against our own CI's Gradle 8.14.3 and
+against a fresh Gradle 9.6.1 project (including `--configuration-cache`); not exhaustively
+tested across every minor release, but the plugin only uses stable, non-deprecated
+`AbstractArchiveTask`/`CopySpec` APIs, so other 8.x/9.x versions are expected to work too.
 
 ## Usage
 

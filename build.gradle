@@ -102,20 +102,20 @@ tasks.register('compileNativeDeflate') {
             def javaHome = javaToolchains.launcherFor {
                 languageVersion = JavaLanguageVersion.of(17)
             }.get().metadata.installationPath.asFile.absolutePath
-            exec {
+            providers.exec {
                 workingDir buildDir
                 environment 'JAVA_HOME', javaHome
                 commandLine 'cmake', '-DCMAKE_BUILD_TYPE=Release',
                         "-DPZIP_NATIVE_OUT_DIR=${outDir.absolutePath}", nativeSrcDir.absolutePath
-            }
-            exec {
+            }.result.get()
+            providers.exec {
                 workingDir buildDir
                 commandLine 'cmake', '--build', '.', '--config', 'Release'
-            }
-            exec {
+            }.result.get()
+            providers.exec {
                 workingDir buildDir
                 commandLine 'cmake', '--install', '.', '--config', 'Release'
-            }
+            }.result.get()
             logger.lifecycle("parallel-zip: built native libdeflate accelerator for ${nativeClassifier}")
         } catch (Exception ex) {
             logger.warn("parallel-zip: skipping native libdeflate build for ${nativeClassifier} " +
