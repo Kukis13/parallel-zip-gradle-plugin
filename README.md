@@ -1,6 +1,7 @@
 # Parallel Zip — a multithreaded, reproducible Gradle archive task
 
 [![CI](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 `parallel-zip` is a small, dependency-free custom task that compresses entries across
 **all your cores** — or skips compression entirely (`STORE`) — and produces a
