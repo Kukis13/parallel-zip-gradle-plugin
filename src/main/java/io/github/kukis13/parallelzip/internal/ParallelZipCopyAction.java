@@ -19,13 +19,19 @@ import java.nio.file.Path;
  * Bridges Gradle's copy pipeline to {@link ParallelZipWriter}. Gradle resolves the whole
  * {@code CopySpec} (all {@code from}/{@code into}/{@code include}/{@code exclude}/
  * {@code rename}/{@code filter}, plus duplicate handling and reproducible ordering via its
- * decorators) and streams the final files here; we materialize each and feed it to the
- * parallel writer, so the archive is built across all cores.
+ * decorators) and streams the final files here; we hand each off to the parallel writer, so
+ * the archive is built across all cores.
  *
- * <p>Content is consumed during the (single-threaded) stream iteration — required because a
- * filtered file is a transformed stream, not a real file. Small entries are buffered in
- * memory; entries over the spill threshold are copied to a temp file. Backpressure from the
- * {@link ParallelZipWriter.Sink} bounds how many entries are materialized at once.</p>
+ * <p>An entry with no content filter/transform configured is handed off as a reference to its
+ * real source file, read lazily on a worker thread at compress time -- same as the streamed/
+ * spilled path already does. This is safe because Gradle's own {@code FileCopyDetails} only
+ * exposes the real file when no filter is present: {@code getFile()} and {@code open()} share
+ * the identical guard, so whenever {@code getFile()} doesn't throw, it returns exactly the
+ * bytes {@code open()} would have. A filtered entry's content is a transformed stream, not a
+ * real file, so it's still consumed on this (single-threaded) stream iteration -- Gradle's
+ * filter chain has to run through its own API. Small entries are buffered in memory; entries
+ * over the spill threshold are copied to a temp file. Backpressure from the
+ * {@link ParallelZipWriter.Sink} bounds how many entries are materialized/queued at once.</p>
  */
 public final class ParallelZipCopyAction implements CopyAction {
 
@@ -87,8 +93,23 @@ public final class ParallelZipCopyAction implements CopyAction {
         if (dir) {
             return ParallelZipWriter.dirEntry(name, dt[0], dt[1], extAttr);
         }
+        Path real = rawFileOrNull(details);
+        if (real != null) {
+            // No filter: defer the read to compress time, on a worker thread, instead of
+            // reading it here on Gradle's single-threaded copy walk.
+            return ParallelZipWriter.fileEntry(name, real, false, Files.size(real), dt[0], dt[1], extAttr);
+        }
         try (InputStream in = details.open()) {
             return materialize(name, in, spillDir, dt[0], dt[1], extAttr);
+        }
+    }
+
+    /** Null means a content filter is configured for this entry, so {@code open()} must be used. */
+    private static Path rawFileOrNull(FileCopyDetailsInternal details) {
+        try {
+            return details.getFile().toPath();
+        } catch (UnsupportedOperationException filtered) {
+            return null;
         }
     }
 

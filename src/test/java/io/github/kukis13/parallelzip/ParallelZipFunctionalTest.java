@@ -184,4 +184,42 @@ class ParallelZipFunctionalTest {
         assertTrue(props.contains("version=1.2.3"), "filter replaced token: " + props);
         assertFalse(props.contains("@version@"), "token should be gone");
     }
+
+    /**
+     * Unfiltered entries are handed off as a reference to their real source file (read lazily
+     * on a worker thread at compress time) instead of being read eagerly on Gradle's
+     * single-threaded copy walk -- see {@code ParallelZipCopyAction.rawFileOrNull}. Exercises
+     * that path at a scale that spans several compression batches, through the real Gradle
+     * CopySpec/CopyAction pipeline (not just the internal writer API), alongside one filtered
+     * file to confirm both paths still coexist correctly.
+     */
+    @Test
+    void manyUnfilteredEntriesReadLazilyDecodeCorrectly() throws Exception {
+        settings();
+        Path src = projectDir.resolve("staging");
+        Files.createDirectories(src);
+        final int count = 500;
+        for (int i = 0; i < count; i++) {
+            Files.writeString(src.resolve("f" + i + ".txt"), ("content of file " + i + " ").repeat(20 + i % 30));
+        }
+        Path conf = projectDir.resolve("conf");
+        Files.createDirectories(conf);
+        Files.writeString(conf.resolve("app.properties"), "version=@version@\n");
+
+        buildFile("""
+                    from 'staging'
+                    from('conf') {
+                        filter(ReplaceTokens, tokens: [version: '9.9.9'])
+                    }
+                """);
+        run("dist");
+
+        Path zip = archive();
+        assertEquals(count + 1, verifyAllEntries(zip));
+        for (int i = 0; i < count; i++) {
+            String expected = ("content of file " + i + " ").repeat(20 + i % 30);
+            assertEquals(expected, readEntry(zip, "f" + i + ".txt"), "content mismatch for f" + i + ".txt");
+        }
+        assertTrue(readEntry(zip, "app.properties").contains("version=9.9.9"), "filtered entry still correct");
+    }
 }

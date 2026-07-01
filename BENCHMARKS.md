@@ -29,20 +29,28 @@ per-entry pipeline overhead outweighs the compression saved — the only corpus 
 DEFLATE is slower than single-threaded `Zip`. Use `store = true` only for archives you
 already know are jar/binary-heavy, where STORE's size cost is small and the speedup large.
 
-## Small-entry batching (1.1.0+)
+## Small-entry batching + lazy reads (1.1.0)
 
-The table above predates 1.1.0, which batches small entries into fewer compression
-tasks (see [Options](README.md#options)) to cut per-task scheduling overhead. Spot-checked
-on four of the projects above, comparing 1.1.0 against 1.0.0 under identical conditions:
+Two changes landed together in 1.1.0: small entries are batched into fewer compression
+tasks, and entries with no content filter are read lazily on a worker thread at compress
+time instead of eagerly on Gradle's single-threaded copy walk (see
+[Options](README.md#options)). The table above predates both. Comparing 1.1.0 against
+1.0.0 under identical conditions:
 
 | Project | Files | 1.0.0 DEFLATE speedup | 1.1.0 DEFLATE speedup | Change |
 |---|--:|--:|--:|--:|
-| ZooKeeper 3.9.3 | 1,632 | 3.02× | 3.36× | +23% faster |
-| Gradle 8.14.3 | 22,427 | 1.96× | 2.16× | +10% faster |
-| Groovy 4.0.24 | 9,756 | 0.857× (slower) | 0.890× (slower) | +3.2% faster, still net slower |
-| SonarQube Community Build 26.6 | 749 | 3.15× | 3.16× | neutral |
+| ZooKeeper 3.9.3 | 1,632 | 3.02× | **4.55×** | +51% faster |
+| Gradle 8.14.3 | 22,427 | 1.96× | **2.45×** | +25% faster |
+| Groovy 4.0.24 | 9,756 | 0.857× (slower) | **2.55×** | regression fully reversed — 3× faster in absolute time |
+| SonarQube Community Build 26.6 | 749 | 3.15× | 3.16×¹ | neutral |
 
-Batching helps in proportion to how many small entries there are to amortize scheduling
-overhead across, and is a no-op where there aren't many (SonarQube: few, large files).
-It narrows Groovy's regression without eliminating it — some many-small-file corpora are
-still net slower than single-threaded `Zip`.
+¹ SonarQube was spot-checked against the batching change alone, not the combined build;
+given how few files it has (mostly large jars), it's expected to stay close to neutral
+either way — the lazy-read win specifically comes from avoiding per-file overhead on
+Gradle's single-threaded walk, which barely matters when there are only hundreds of files.
+
+Lazy reads turn out to matter far more than batching alone: the serial per-file
+read-and-copy on Gradle's copy walk was the dominant bottleneck for many-small-file
+archives, not per-task compression scheduling. Groovy — the one corpus where DEFLATE
+was slower than single-threaded `Zip` — goes from the worst result in the table to one
+of the best.

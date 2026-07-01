@@ -74,10 +74,21 @@ On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled nat
 so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or any
 failure loading the native build, falls back to the pure-Java path automatically.
 
-Small entries are also batched into fewer compression tasks, amortizing per-task
-scheduling overhead across many small files — a real win on archives with lots of
-small entries (spot-checked up to +23% faster), and a no-op elsewhere. This is always
-on; there's no configuration for it.
+Two more optimizations for archives with lots of small entries, both always on with no
+configuration needed:
+
+- **Small entries are batched** into fewer compression tasks, amortizing per-task
+  scheduling overhead across many small files.
+- **Unfiltered entries are read lazily**, on a worker thread at compress time, instead
+  of eagerly on Gradle's single-threaded copy walk — this is the bigger win of the two.
+  Gradle's own `FileCopyDetails` exposes the real source file only when no content
+  filter is configured (`getFile()` and `open()` share the identical guard), so this
+  never touches filtered entries; a filtered file is still read on the walk, since
+  Gradle's filter chain has to run through its own API.
+
+Together, on many-small-file archives, these turned what used to be the one case where
+DEFLATE was *slower* than single-threaded `Zip` into one of the largest speedups
+measured (see [Benchmarks](#benchmarks)).
 
 ## Benchmarks
 
@@ -110,7 +121,6 @@ unaffected either way.
 
 ## Roadmap
 
-- Optional per-entry parallel *reads* for filter-free specs (skip materialization).
 - Zero-copy (mmap) reads for large entries, feeding the native accelerator directly
   instead of copying through a JVM byte array.
 - Fuse CRC32 computation into the same buffer pass as compression instead of two scans.
