@@ -97,9 +97,9 @@ in **[BENCHMARKS.md](BENCHMARKS.md)**:
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.33 s | 0.48 s (**2.8×**) | 0.38 s (**3.5×**) | 0.13 s (**10.0×**) | +18.6% |
-| Solr 9.7.0 | 2,091 | 308.5 MiB | 6.68 s | 2.28 s (**2.9×**) | 1.94 s (**3.4×**) | 0.74 s (**9.0×**) | +12.4% |
-| SonarQube Community Build 26.6 | 749 | 966.6 MiB | 20.93 s | 6.56 s (**3.2×**) | 6.25 s (**3.4×**) | 2.00 s (**10.5×**) | +9.2% |
+| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.38 s | 0.42 s (**3.29×**) | 0.39 s (**3.52×**) | 0.12 s (**11.30×**) | +18.6% |
+| Solr 9.7.0 | 2,091 | 308.5 MiB | 6.89 s | 1.95 s (**3.54×**) | 1.80 s (**3.82×**) | 0.63 s (**10.87×**) | +12.4% |
+| SonarQube Community Build 26.6 | 749 | 966.6 MiB | 21.11 s | 6.55 s (**3.22×**) | 6.33 s (**3.33×**) | 1.78 s (**11.88×**) | +9.2% |
 
 DEFLATE never produces a bigger archive than the baseline in practice, so it's the safe
 default. Use `store = true` only for archives you already know are jar/binary-heavy,
