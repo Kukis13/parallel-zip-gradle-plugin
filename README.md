@@ -67,12 +67,23 @@ Archives beyond the standard ZIP limits — over 4 GiB, over 65,535 entries, or 
 offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields and end-of-central-directory
 records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
+On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled native
+[libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
+`Deflater` — measured ~2–2.5× faster at the same level, at the cost of a somewhat
+larger output (libdeflate's level numbering isn't ratio-equivalent to zlib's; expect
+roughly 8–10% bigger than the JDK codec at the same `level`). It only covers the
+in-memory fast path (libdeflate has no streaming API), so large/spilled entries always
+use the JDK `Deflater`. Every other platform/arch, or any failure loading the native
+build, falls back to the pure-Java path automatically with no configuration needed.
+
 ## Benchmarks
 
 Measured across the official binary distributions of ten popular open-source Java
 projects: extract the distribution, then archive the identical directory tree three ways
-— Gradle `Zip` (DEFLATE, baseline), `parallel-zip` DEFLATE (byte-identical output), and
-`parallel-zip` STORE. Same machine throughout: 12 logical cores, JDK 21, warm file cache.
+— Gradle `Zip` (DEFLATE, baseline), `parallel-zip` DEFLATE, and `parallel-zip` STORE.
+Same machine throughout: 12 logical cores, JDK 21, warm file cache. Predates the native
+libdeflate accelerator (both DEFLATE runs used the JDK codec, hence identical sizes);
+see [Options](#options) for how the native path changes the size/speed tradeoff.
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|
@@ -113,10 +124,14 @@ Compression runs in parallel but entries are always written in a fixed order (Gr
 resolved copy order, honouring `reproducibleFileOrder`), so scheduling never affects the
 bytes. For fully reproducible builds also ensure identical file **contents** and the same
 **JDK** (the DEFLATE codec must match); `store = true` sidesteps the codec dependency.
+The native libdeflate accelerator is an additional codec dependency on top of the JDK:
+builds on `linux-x64`/`windows-x64` use it, builds elsewhere fall back to the JDK
+`Deflater`, so byte-identical output across *different platforms* also requires both
+sides to have (or both lack) the native accelerator — same-platform reproducibility is
+unaffected either way.
 
 ## Roadmap
 
-- Pluggable codecs (e.g. libdeflate / zstd) for the compressible slice.
 - Optional per-entry parallel *reads* for filter-free specs (skip materialization).
 
 ## Building
@@ -128,4 +143,5 @@ bytes. For fully reproducible builds also ensure identical file **contents** and
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE). Third-party notices (the bundled
+libdeflate accelerator) are in [NOTICE.md](NOTICE.md).
