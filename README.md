@@ -1,5 +1,7 @@
 # Parallel Zip — a multithreaded, reproducible Gradle archive task
 
+[![CI](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/Kukis13/parallel-zip-gradle-plugin/actions/workflows/ci.yml)
+
 Gradle's built-in `Zip` task is **single-threaded** and re-DEFLATEs everything, even
 content that is already compressed (jars, `.gz`, images). For large, jar-heavy
 distributions that makes archiving one of the slowest tasks in the build.
