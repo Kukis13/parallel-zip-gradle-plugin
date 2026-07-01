@@ -121,7 +121,13 @@ unaffected either way.
 
 ## Roadmap
 
+- Batch small entries into fewer compression work-units, to cut the per-entry pipeline
+  overhead that currently makes DEFLATE slower than baseline on many-small-file corpora
+  (see Groovy in [Benchmarks](#benchmarks)).
 - Optional per-entry parallel *reads* for filter-free specs (skip materialization).
+- Zero-copy (mmap) reads for large entries, feeding the native accelerator directly
+  instead of copying through a JVM byte array.
+- Fuse CRC32 computation into the same buffer pass as compression instead of two scans.
 
 ## Contributing
 
