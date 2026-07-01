@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # Manual "Run workflow" button in the Actions tab. This is the only way the
+  # publish step below ever runs -- a normal push or PR never publishes.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -130,3 +133,13 @@ jobs:
           name: parallel-zip-plugin-jar
           path: build/libs/*.jar
           retention-days: 14
+
+      # Only runs when someone clicks "Run workflow" in the Actions tab -- never
+      # on a push or PR. Requires the GRADLE_PUBLISH_KEY / GRADLE_PUBLISH_SECRET
+      # repository secrets (Settings -> Secrets and variables -> Actions).
+      - name: Publish to Gradle Plugin Portal
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+        run: ./gradlew publishPlugins -PpzipPrebuiltNativesDir=merged-natives -x compileNativeDeflate --no-daemon --stacktrace

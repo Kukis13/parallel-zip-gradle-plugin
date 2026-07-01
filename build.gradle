@@ -1,8 +1,7 @@
 plugins {
     id 'java-gradle-plugin'
     id 'maven-publish'
-    // Uncomment to publish to the Gradle Plugin Portal (requires the plugin-publish plugin):
-    // id 'com.gradle.plugin-publish' version '1.3.1'
+    id 'com.gradle.plugin-publish' version '1.3.1'
 }
 
 group = 'io.github.kukis13'
@@ -132,3 +131,15 @@ sourceSets {
 
 tasks.named('processResources') { dependsOn 'compileNativeDeflate' }
 tasks.named('test') { dependsOn 'compileNativeDeflate' }
+
+// The sources jar (added by com.gradle.plugin-publish) shouldn't bundle compiled
+// native binaries -- exclude them rather than pull in an implicit task dependency
+// on compileNativeDeflate for a jar that's meant to hold Java sources only.
+// tasks.matching (not tasks.named) because sourcesJar is registered later, in an
+// afterEvaluate block added by the plugin-publish plugin. Still depends on
+// compileNativeDeflate (even though its output is excluded below) because its
+// CopySpec reads the same resources srcDir that task writes to.
+tasks.matching { it.name == 'sourcesJar' }.configureEach {
+    dependsOn 'compileNativeDeflate'
+    exclude 'natives/**'
+}
