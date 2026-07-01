@@ -1,7 +1,7 @@
 plugins {
     id 'java-gradle-plugin'
     id 'maven-publish'
-    id 'com.gradle.plugin-publish' version '1.3.1'
+    id 'com.gradle.plugin-publish' version '2.1.1'
 }
 
 group = 'io.github.kukis13'
@@ -38,6 +38,12 @@ gradlePlugin {
             description = 'A multithreaded, reproducible drop-in for slow Zip tasks. ' +
                     'Compresses entries across all cores (DEFLATE) or STOREs them for maximum speed.'
             tags.set(['zip', 'archive', 'parallel', 'performance', 'reproducible-builds'])
+
+            compatibility(it) {
+                features {
+                    configurationCache = true
+                }
+            }
         }
     }
 }
