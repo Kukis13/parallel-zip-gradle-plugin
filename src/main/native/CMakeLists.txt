@@ -8,7 +8,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
 set(LIBDEFLATE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory(libdeflate)
+# EXCLUDE_FROM_ALL: libdeflate_static is only wanted as a link dependency of
+# pzip_libdeflate; this also drops libdeflate's own install() rules, which
+# would otherwise try to install headers/libs system-wide (e.g. into
+# C:/Program Files) and fail "cmake --install" on non-elevated machines.
+add_subdirectory(libdeflate EXCLUDE_FROM_ALL)
 
 # CMake's own FindJNI additionally requires the AWT native headers/libs,
 # which don't exist in headless JDKs and aren't needed for a plain JNI
@@ -30,6 +34,12 @@ if(NOT PZIP_JNI_INCLUDE_DIR OR NOT PZIP_JNI_MD_INCLUDE_DIR)
 endif()
 
 add_library(pzip_libdeflate SHARED jni/pzip_libdeflate.c)
+# The Java loader looks for exactly "pzip_libdeflate.dll" on Windows; MinGW
+# toolchains would otherwise emit "libpzip_libdeflate.dll" (no-op for MSVC,
+# and Linux keeps its conventional "lib" prefix).
+if(WIN32)
+    set_target_properties(pzip_libdeflate PROPERTIES PREFIX "")
+endif()
 target_include_directories(pzip_libdeflate PRIVATE ${PZIP_JNI_INCLUDE_DIR} ${PZIP_JNI_MD_INCLUDE_DIR} libdeflate)
 target_link_libraries(pzip_libdeflate PRIVATE libdeflate::libdeflate_static)
 
