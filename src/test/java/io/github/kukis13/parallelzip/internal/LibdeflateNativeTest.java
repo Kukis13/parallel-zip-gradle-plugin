@@ -21,8 +21,13 @@ class LibdeflateNativeTest {
         assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
         byte[] input = "The quick brown fox jumps over the lazy dog. ".repeat(20_000)
                 .getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        int compLen = compress(input, 6);
-        assertTrue(compLen > 0 && compLen < input.length, "should compress well below the input size");
+        long handle = alloc(6);
+        try {
+            int compLen = compress(handle, input);
+            assertTrue(compLen > 0 && compLen < input.length, "should compress well below the input size");
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
     }
 
     @Test
@@ -30,25 +35,86 @@ class LibdeflateNativeTest {
         assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
         byte[] input = new byte[500_000];
         new Random(42).nextBytes(input);
-        int compLen = compress(input, 6);
-        assertTrue(compLen > 0, "native compress must succeed even when incompressible");
+        long handle = alloc(6);
+        try {
+            int compLen = compress(handle, input);
+            assertTrue(compLen > 0, "native compress must succeed even when incompressible");
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
     }
 
     @Test
     void handlesEmptyInputWithoutCrashing() {
         assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
-        byte[] out = new byte[64];
-        int n = LibdeflateNative.compress(new byte[0], 0, 0, out, 0, out.length, 6);
-        assertTrue(n >= 0, "empty input must not fail or crash");
+        long handle = alloc(6);
+        try {
+            byte[] out = new byte[64];
+            int n = LibdeflateNative.compress(handle, new byte[0], 0, 0, out, 0, out.length);
+            assertTrue(n >= 0, "empty input must not fail or crash");
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    @Test
+    void compressorHandleIsReusableAcrossManyCalls() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        long handle = alloc(6);
+        try {
+            for (int i = 0; i < 500; i++) {
+                byte[] input = ("entry " + i + " ").repeat(200).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                int compLen = compress(handle, input);
+                assertTrue(compLen > 0 && compLen < input.length, "reused handle must keep compressing correctly");
+            }
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    @Test
+    void compressBatchMatchesPerEntryCompression() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        long handle = alloc(6);
+        try {
+            int n = 300;
+            byte[][] ins = new byte[n][];
+            byte[][] outs = new byte[n][];
+            Random rnd = new Random(7);
+            for (int i = 0; i < n; i++) {
+                byte[] input = ("payload-" + i + "-").repeat(50 + rnd.nextInt(200))
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                ins[i] = input;
+                outs[i] = new byte[input.length + (input.length >> 12) + 64];
+            }
+            int[] outLens = new int[n];
+            LibdeflateNative.compressBatch(handle, ins, outs, outLens, n);
+            for (int i = 0; i < n; i++) {
+                assertTrue(outLens[i] > 0, "entry " + i + " must compress successfully in a batch call");
+                assertRoundTrips(ins[i], outs[i], outLens[i]);
+            }
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    private static long alloc(int level) {
+        long handle = LibdeflateNative.allocCompressor(level);
+        assertTrue(handle != 0, "compressor allocation must succeed");
+        return handle;
     }
 
     /** Compresses via the native codec and asserts the raw-DEFLATE round trip matches. */
-    private static int compress(byte[] input, int level) throws Exception {
+    private static int compress(long handle, byte[] input) throws Exception {
         int cap = input.length + (input.length >> 12) + 64;
         byte[] out = new byte[cap];
-        int compLen = LibdeflateNative.compress(input, 0, input.length, out, 0, cap, level);
+        int compLen = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap);
         assertTrue(compLen > 0, "native compress must succeed");
+        assertRoundTrips(input, out, compLen);
+        return compLen;
+    }
 
+    private static void assertRoundTrips(byte[] input, byte[] out, int compLen) throws Exception {
         Inflater inf = new Inflater(true); // nowrap = raw deflate, matching the JNI side
         inf.setInput(out, 0, compLen);
         byte[] decoded = new byte[input.length];
@@ -60,6 +126,5 @@ class LibdeflateNativeTest {
         }
         inf.end();
         assertArrayEquals(input, decoded, "round-trip mismatch");
-        return compLen;
     }
 }

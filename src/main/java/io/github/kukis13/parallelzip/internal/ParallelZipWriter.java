@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -173,6 +174,13 @@ public final class ParallelZipWriter {
         private static final long MIB = 1L << 20;
         private final ExecutorService pool;
         private final ThreadLocal<Deflater> deflaters;
+        // One native libdeflate compressor per worker thread, reused for every entry that
+        // thread compresses (allocating one is real cost -- it sizes match-finder tables --
+        // so paying it once per thread beats once per entry). Only allocated when store is
+        // false and the native library is loaded; otherwise every thread's handle is 0,
+        // which every native call site treats as "unavailable, use the JDK Deflater".
+        private final ThreadLocal<Long> nativeHandles;
+        private final ConcurrentLinkedQueue<Long> allocatedNativeHandles = new ConcurrentLinkedQueue<>();
         private final Semaphore countFlight;   // bounds the NUMBER of in-flight entries
         private final Semaphore byteFlight;     // bounds in-memory BYTES held (in MiB units)
         private final int budgetMiB;
@@ -213,6 +221,13 @@ public final class ParallelZipWriter {
             this.spillDir = spillDir;
             this.pool = Executors.newFixedThreadPool(threads);
             this.deflaters = ThreadLocal.withInitial(() -> new Deflater(level, true));
+            boolean useNative = !store && LibdeflateNative.available();
+            this.nativeHandles = ThreadLocal.withInitial(() -> {
+                if (!useNative) return 0L;
+                long h = allocNativeCompressor(level);
+                if (h != 0) allocatedNativeHandles.add(h);
+                return h;
+            });
             this.countFlight = new Semaphore(threads * 4);
             // Cap in-memory bytes to a fraction of the heap so entries can't OOM the daemon.
             this.budgetMiB = (int) Math.max(16, Math.min(1024, Runtime.getRuntime().maxMemory() / 6 / MIB));
@@ -256,8 +271,19 @@ public final class ParallelZipWriter {
             byteFlight.acquire(permits);  // backpressure on memory; released by the writer
             countFlight.acquire();
             Future<List<Compressed>> f =
-                    pool.submit(() -> compressBatch(batch, store, level, deflaters.get(), spillThreshold, spillDir));
+                    pool.submit(() -> compressBatch(batch, store, level, deflaters.get(), nativeHandles.get(),
+                            spillThreshold, spillDir));
             queue.put(new Item(f, permits));
+        }
+
+        /** Returns 0 (meaning "unavailable, use the JDK Deflater") on any allocation failure. */
+        private static long allocNativeCompressor(int level) {
+            int nativeLevel = level < 0 ? 6 : level; // -1 sentinel means "zlib default"
+            try {
+                return LibdeflateNative.allocCompressor(nativeLevel);
+            } catch (Throwable t) {
+                return 0L;
+            }
         }
 
         /**
@@ -286,9 +312,14 @@ public final class ParallelZipWriter {
             try {
                 flushBatch();
                 queue.put(POISON_ITEM);
+                // The writer thread only reaches POISON after it has already called
+                // future().get() on every real item in submission order, so every
+                // compress task has fully completed by the time join() returns below --
+                // freeing native handles right after is safe, no task can still be using one.
                 writerThread.join();
             } finally {
                 pool.shutdown();
+                for (Long h : allocatedNativeHandles) LibdeflateNative.freeCompressor(h);
             }
             if (writerError != null) throw writerError;
             long ms = (System.nanoTime() - startNanos) / 1_000_000L;
@@ -376,43 +407,112 @@ public final class ParallelZipWriter {
         }
     }
 
-    /** Compresses each entry in the batch in turn, on one submitted task. */
+    /**
+     * Compresses the batch on one submitted task. When it's a genuine multi-entry batch
+     * (guaranteed by the caller to be all small, in-memory, non-directory entries) and a
+     * native compressor is available, every buffer in the batch is compressed with a
+     * single native call instead of one call per entry -- see
+     * {@link LibdeflateNative#compressBatch}. Singleton "batches" (directories, streamed
+     * entries, or the lone trailing entry after a flush) go through the regular per-entry
+     * path, which still uses the same reused native handle for a single-buffer call.
+     */
     private static List<Compressed> compressBatch(List<Entry> batch, boolean store, int level, Deflater def,
-                                                  long spillThreshold, Path spillDir) {
+                                                  long nativeHandle, long spillThreshold, Path spillDir) {
+        if (!store && nativeHandle != 0 && batch.size() > 1) {
+            return compressBatchNative(batch, def, nativeHandle);
+        }
         List<Compressed> out = new ArrayList<>(batch.size());
         for (Entry e : batch) {
-            out.add(compress(e, store, level, def, spillThreshold, spillDir));
+            out.add(compress(e, store, level, def, nativeHandle, spillThreshold, spillDir));
         }
         return out;
     }
 
-    private static Compressed compress(Entry e, boolean store, int level, Deflater def,
-                                       long spillThreshold, Path spillDir) {
+    /**
+     * Compresses every (small, in-memory, non-directory) entry in the batch with one
+     * native call, reusing {@code nativeHandle} for all of them. Any entry the native call
+     * can't handle falls back individually to the JDK {@link Deflater}, same as the
+     * single-entry path -- one entry's failure never affects the rest of the batch.
+     */
+    private static List<Compressed> compressBatchNative(List<Entry> batch, Deflater def, long nativeHandle) {
+        int n = batch.size();
+        byte[][] raws = new byte[n][];
+        long[] crcs = new long[n];
+        byte[][] outs = new byte[n][];
+        boolean[] empty = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            byte[] raw = readSmallEntry(batch.get(i));
+            raws[i] = raw;
+            CRC32 crc = new CRC32();
+            crc.update(raw);
+            crcs[i] = crc.getValue();
+            empty[i] = raw.length == 0;
+            // A distinct (not aliased) array even when empty: passing the same array
+            // object as both input and output would pin it twice under
+            // GetPrimitiveArrayCritical in the native call, which is unspecified behavior.
+            outs[i] = empty[i] ? new byte[0] : new byte[raw.length + (raw.length >> 12) + 64];
+        }
+
+        int[] outLens = new int[n];
+        LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, n);
+
+        List<Compressed> result = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            Entry e = batch.get(i);
+            byte[] raw = raws[i];
+            if (empty[i]) {
+                result.add(new Compressed(e, raw, null, false, crcs[i], 0, 0, 0));
+            } else if (outLens[i] <= 0) {
+                result.add(compressWithJdk(e, raw, def, crcs[i])); // native failed: JDK fallback
+            } else if (outLens[i] >= raw.length) { // deflate didn't help: store this entry
+                result.add(new Compressed(e, raw, null, false, crcs[i], raw.length, raw.length, 0));
+            } else {
+                result.add(new Compressed(e, outs[i], null, false, crcs[i], raw.length, outLens[i], 8));
+            }
+        }
+        return result;
+    }
+
+    private static byte[] readSmallEntry(Entry e) {
         try {
-            if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
-            if (e.inline != null) {
-                return compressBytes(e, e.inline, store, level, def);
-            }
-            if (e.size > spillThreshold) {
-                return compressLarge(e, store, level, spillDir);
-            }
-            return compressBytes(e, Files.readAllBytes(e.file), store, level, def);
+            return e.inline != null ? e.inline : Files.readAllBytes(e.file);
         } catch (IOException ex) {
             throw new RuntimeException("Failed to compress " + e.name, ex);
         }
     }
 
-    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, int level, Deflater def) {
+    private static Compressed compress(Entry e, boolean store, int level, Deflater def,
+                                       long nativeHandle, long spillThreshold, Path spillDir) {
+        try {
+            if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
+            if (e.inline != null) {
+                return compressBytes(e, e.inline, store, def, nativeHandle);
+            }
+            if (e.size > spillThreshold) {
+                return compressLarge(e, store, level, spillDir);
+            }
+            return compressBytes(e, Files.readAllBytes(e.file), store, def, nativeHandle);
+        } catch (IOException ex) {
+            throw new RuntimeException("Failed to compress " + e.name, ex);
+        }
+    }
+
+    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def,
+                                            long nativeHandle) {
         CRC32 crc = new CRC32();
         crc.update(raw);
         if (store || raw.length == 0) {
             return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
         }
-        if (LibdeflateNative.available()) {
-            Compressed viaNative = tryNativeDeflate(e, raw, level, crc.getValue());
+        if (nativeHandle != 0) {
+            Compressed viaNative = tryNativeDeflate(e, raw, nativeHandle, crc.getValue());
             if (viaNative != null) return viaNative;
             // fell through: native call failed for some reason, use the JDK path below
         }
+        return compressWithJdk(e, raw, def, crc.getValue());
+    }
+
+    private static Compressed compressWithJdk(Entry e, byte[] raw, Deflater def, long crcValue) {
         def.reset();
         def.setInput(raw);
         def.finish();
@@ -427,18 +527,17 @@ public final class ParallelZipWriter {
         }
         int compLen = bos.size();
         if (compLen >= raw.length) { // deflate didn't help: store this entry
-            return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
+            return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);
         }
         // data may be longer than compLen; Compressed writes exactly compSize bytes.
-        return new Compressed(e, bos.raw(), null, false, crc.getValue(), raw.length, compLen, 8);
+        return new Compressed(e, bos.raw(), null, false, crcValue, raw.length, compLen, 8);
     }
 
     /** Returns null (caller falls back to the JDK Deflater) if the native call fails for any reason. */
-    private static Compressed tryNativeDeflate(Entry e, byte[] raw, int level, long crcValue) {
-        int nativeLevel = level < 0 ? 6 : level; // -1 sentinel means "zlib default"
+    private static Compressed tryNativeDeflate(Entry e, byte[] raw, long nativeHandle, long crcValue) {
         int cap = raw.length + (raw.length >> 12) + 64;
         byte[] out = new byte[cap];
-        int n = LibdeflateNative.compress(raw, 0, raw.length, out, 0, cap, nativeLevel);
+        int n = LibdeflateNative.compress(nativeHandle, raw, 0, raw.length, out, 0, cap);
         if (n <= 0) return null;
         if (n >= raw.length) { // deflate didn't help: store this entry
             return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);

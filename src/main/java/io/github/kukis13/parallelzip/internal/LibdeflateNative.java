@@ -29,14 +29,36 @@ public final class LibdeflateNative {
     }
 
     /**
-     * Compresses {@code in[inOff, inOff+inLen)} into {@code out[outOff, outOff+outCap)}
-     * using raw DEFLATE. Returns the compressed length, or a negative value if
-     * the native call failed for any reason (e.g. the output buffer was too
-     * small) — callers should fall back to the JDK {@link java.util.zip.Deflater}
-     * in that case.
+     * Allocates a native compressor for the given DEFLATE level (1..12), to be reused
+     * across many {@link #compress}/{@link #compressBatch} calls -- typically one per
+     * worker thread, held for the life of a write. Returns {@code 0} on failure (e.g.
+     * out of memory); callers must treat that as "native unavailable" and fall back to
+     * the JDK {@link java.util.zip.Deflater} instead of passing the zero handle through.
      */
-    public static native int compress(byte[] in, int inOff, int inLen,
-                                       byte[] out, int outOff, int outCap, int level);
+    public static native long allocCompressor(int level);
+
+    /** Releases a handle returned by {@link #allocCompressor}. A no-op if {@code handle} is 0. */
+    public static native void freeCompressor(long handle);
+
+    /**
+     * Compresses {@code in[inOff, inOff+inLen)} into {@code out[outOff, outOff+outCap)}
+     * using raw DEFLATE, with the compressor identified by {@code handle}. Returns the
+     * compressed length, or a negative value if the native call failed for any reason
+     * (e.g. the output buffer was too small) — callers should fall back to the JDK
+     * {@link java.util.zip.Deflater} in that case.
+     */
+    public static native int compress(long handle, byte[] in, int inOff, int inLen,
+                                       byte[] out, int outOff, int outCap);
+
+    /**
+     * Compresses {@code count} independent buffers in one native call, reusing
+     * {@code handle} for all of them. {@code ins[i]} is compressed in full into
+     * {@code outs[i]}; {@code outLens[i]} receives the compressed length, or a negative
+     * value if that one entry failed and needs a JDK {@link java.util.zip.Deflater}
+     * fallback -- one entry's failure does not affect the others in the batch.
+     */
+    public static native void compressBatch(long handle, byte[][] ins, byte[][] outs,
+                                             int[] outLens, int count);
 
     private static boolean load() {
         try {
