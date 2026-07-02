@@ -6,6 +6,7 @@ import java.util.Random;
 import java.util.zip.Inflater;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -31,14 +32,50 @@ class LibdeflateNativeTest {
     }
 
     @Test
-    void compressesIncompressibleRandomDataAndRoundTrips() throws Exception {
+    void largeIncompressibleInputIsSniffedToStore() throws Exception {
         assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
-        byte[] input = new byte[500_000];
+        byte[] input = new byte[500_000]; // >= sniff threshold (256 KiB) and incompressible
         new Random(42).nextBytes(input);
         long handle = alloc(6);
         try {
+            byte[] out = new byte[input.length + (input.length >> 12) + 64];
+            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, out.length);
+            assertEquals(LibdeflateNative.STORE_SENTINEL, n,
+                    "the incompressibility sniff must flag a large random buffer for STORE");
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    @Test
+    void smallIncompressibleInputIsNotSniffedAndStillRoundTrips() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        byte[] input = new byte[100_000]; // below the 256 KiB sniff threshold
+        new Random(99).nextBytes(input);
+        long handle = alloc(6);
+        try {
+            int cap = input.length + (input.length >> 12) + 64;
+            byte[] out = new byte[cap];
+            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap);
+            assertTrue(n > 0, "input under the sniff threshold must be compressed, not sniffed to STORE");
+            assertRoundTrips(input, out, n);
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    @Test
+    void largeCompressibleInputIsCompressedNotStored() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        // >= sniff threshold but highly compressible: the sniff must let it through to a
+        // real compression, not mistake it for already-compressed data.
+        byte[] input = "The quick brown fox jumps over the lazy dog. ".repeat(20_000)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(input.length > 256 * 1024, "test input must exceed the sniff threshold");
+        long handle = alloc(6);
+        try {
             int compLen = compress(handle, input);
-            assertTrue(compLen > 0, "native compress must succeed even when incompressible");
+            assertTrue(compLen > 0 && compLen < input.length, "should compress well below the input size");
         } finally {
             LibdeflateNative.freeCompressor(handle);
         }

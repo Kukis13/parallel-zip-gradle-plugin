@@ -462,10 +462,11 @@ public final class ParallelZipWriter {
             byte[] raw = raws[i];
             if (empty[i]) {
                 result.add(new Compressed(e, raw, null, false, crcs[i], 0, 0, 0));
+            } else if (outLens[i] == LibdeflateNative.STORE_SENTINEL || outLens[i] >= raw.length) {
+                // sniff judged it already-compressed, or deflate didn't help: store this entry
+                result.add(new Compressed(e, raw, null, false, crcs[i], raw.length, raw.length, 0));
             } else if (outLens[i] <= 0) {
                 result.add(compressWithJdk(e, raw, def, crcs[i])); // native failed: JDK fallback
-            } else if (outLens[i] >= raw.length) { // deflate didn't help: store this entry
-                result.add(new Compressed(e, raw, null, false, crcs[i], raw.length, raw.length, 0));
             } else {
                 result.add(new Compressed(e, outs[i], null, false, crcs[i], raw.length, outLens[i], 8));
             }
@@ -538,10 +539,11 @@ public final class ParallelZipWriter {
         int cap = raw.length + (raw.length >> 12) + 64;
         byte[] out = new byte[cap];
         int n = LibdeflateNative.compress(nativeHandle, raw, 0, raw.length, out, 0, cap);
-        if (n <= 0) return null;
-        if (n >= raw.length) { // deflate didn't help: store this entry
+        if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= raw.length)) {
+            // sniff judged it already-compressed, or deflate didn't help: store this entry
             return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);
         }
+        if (n <= 0) return null; // real failure: caller uses the JDK Deflater
         return new Compressed(e, out, null, false, crcValue, raw.length, n, 8);
     }
 
@@ -551,10 +553,20 @@ public final class ParallelZipWriter {
         byte[] raw() { return buf; }
     }
 
+    // Incompressibility sniff for streamed (large) entries -- the Java-side mirror of the
+    // native in-memory sniff in pzip_libdeflate.c, for the >SPILL_THRESHOLD files (JREs,
+    // big archives) that stream through the JDK Deflater instead. Probe the head of the
+    // file; if it barely shrinks, skip deflating the whole already-compressed entry and
+    // STORE it (still reading the file once for its CRC). Conservative threshold so
+    // genuinely compressible entries are never mis-stored; content-based, so deterministic.
+    static final int SNIFF_MIN_INPUT = 256 * 1024;
+    static final int SNIFF_SAMPLE = 64 * 1024;
+    static final int SNIFF_KEEP_PCT = 98; // store when the probe compresses to >= this % of its size
+
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
     private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir) throws IOException {
         CRC32 crc = new CRC32();
-        if (store) {
+        if (store || looksIncompressible(e.file, e.size, level)) {
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
@@ -566,6 +578,34 @@ public final class ParallelZipWriter {
         }
         if (e.fileIsTemp) Files.deleteIfExists(e.file); // input temp fully consumed
         return new Compressed(e, null, tmp, true, crc.getValue(), e.size, compSize, 8);
+    }
+
+    /**
+     * Probes the first {@link #SNIFF_SAMPLE} bytes of {@code file} with the JDK Deflater at
+     * {@code level}; returns true when that sample barely shrinks, i.e. the file is almost
+     * certainly already compressed and should be STOREd rather than deflated in full. Files
+     * below {@link #SNIFF_MIN_INPUT}, or where fewer than a full sample can be read, are never
+     * judged incompressible (they just take the normal compress path).
+     */
+    private static boolean looksIncompressible(Path file, long size, int level) throws IOException {
+        if (size < SNIFF_MIN_INPUT) return false;
+        byte[] sample = new byte[SNIFF_SAMPLE];
+        int got;
+        try (InputStream in = Files.newInputStream(file)) {
+            got = in.readNBytes(sample, 0, sample.length);
+        }
+        if (got < SNIFF_SAMPLE) return false;
+        Deflater d = new Deflater(level, true);
+        try {
+            d.setInput(sample, 0, got);
+            d.finish();
+            byte[] tmp = new byte[STREAM_BUF];
+            long comp = 0;
+            while (!d.finished()) comp += d.deflate(tmp);
+            return comp * 100 >= (long) got * SNIFF_KEEP_PCT;
+        } finally {
+            d.end();
+        }
     }
 
     private static void crcOf(Path src, CRC32 crc) throws IOException {

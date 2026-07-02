@@ -101,6 +101,35 @@ class ParallelZipWriterStreamingTest {
     }
 
     @Test
+    void streamedIncompressibleEntryIsSniffedToStore() throws Exception {
+        Path src = tmp.resolve("sniff-src");
+        Files.createDirectories(src);
+        // Both entries exceed the 256 KiB sniff threshold; spill=0 forces both through the
+        // streaming path. The random blob must be STOREd by the sniff, the repetitive text
+        // must still be DEFLATEd -- and both must round-trip.
+        byte[] incompressible = pseudoRandom(300_000);
+        byte[] compressible = "compress me ".repeat(30_000)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Files.write(src.resolve("blob.bin"), incompressible);
+        Files.write(src.resolve("text.txt"), compressible);
+
+        Path out = tmp.resolve("sniff.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, -1, 4, false, false, 0); // spill=0 => everything streams
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            ZipEntry blob = zf.getEntry("blob.bin");
+            ZipEntry text = zf.getEntry("text.txt");
+            assertEquals(ZipEntry.STORED, blob.getMethod(),
+                    "incompressible streamed entry must be STOREd by the sniff");
+            assertEquals(ZipEntry.DEFLATED, text.getMethod(),
+                    "compressible streamed entry must still be DEFLATEd");
+            assertArrayEquals(incompressible, readAllEntries(out).get("blob.bin"));
+            assertArrayEquals(compressible, readAllEntries(out).get("text.txt"));
+        }
+    }
+
+    @Test
     void streamingComposesWithZip64() throws Exception {
         Path src = sampleTree();
         Path out = tmp.resolve("stream-z64.zip");

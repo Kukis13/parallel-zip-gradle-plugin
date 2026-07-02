@@ -14,6 +14,50 @@
  * out), which is why this is only used for the in-memory fast path, not
  * spilled entries.
  */
+
+/*
+ * Incompressibility sniff. Archives of jars/.gz/.png/... are ~entirely
+ * already-compressed bytes: DEFLATE can't shrink them, so compressing each
+ * entry in full only to discover it didn't help (and STORE it anyway) is
+ * wasted CPU -- the dominant cost on jar-heavy archives. Instead, for a
+ * large-enough entry, deflate just the first PZIP_SNIFF_SAMPLE bytes as a
+ * probe; if that barely shrinks, return PZIP_STORE_SENTINEL so the caller
+ * STOREs the whole entry without compressing the rest.
+ *
+ * The probe is written into the caller's output buffer (always at least
+ * input-sized), so no scratch allocation is needed; on a compressible entry
+ * the probe bytes are simply overwritten by the full compression that follows.
+ * The threshold is deliberately conservative (store only when the sample saves
+ * < 2%) so genuinely compressible entries are never mis-stored; the decision
+ * is a pure function of the content, so output stays deterministic.
+ */
+#define PZIP_STORE_SENTINEL   (-2)
+#define PZIP_SNIFF_MIN_INPUT  (256u * 1024u)
+#define PZIP_SNIFF_SAMPLE     (64u * 1024u)
+/* Treat as incompressible when the probe compresses to >= this % of its size. */
+#define PZIP_SNIFF_KEEP_PCT   98u
+
+/*
+ * Compress one whole buffer, sniffing large inputs first. Returns the
+ * compressed length (> 0), PZIP_STORE_SENTINEL (-2) when the sniff says the
+ * input is already compressed and should be STOREd, or -1 on any failure
+ * (output buffer too small) so the caller can fall back to the JDK Deflater.
+ */
+static jint pzip_compress_or_store(struct libdeflate_compressor *c,
+                                   const void *inp, size_t in_len,
+                                   void *outp, size_t out_cap) {
+    if (in_len >= PZIP_SNIFF_MIN_INPUT) {
+        size_t probe = libdeflate_deflate_compress(c, inp, PZIP_SNIFF_SAMPLE, outp, out_cap);
+        if (probe == 0 || probe * 100u >= (size_t) PZIP_SNIFF_SAMPLE * PZIP_SNIFF_KEEP_PCT) {
+            return PZIP_STORE_SENTINEL;
+        }
+        /* Looks compressible: compress the whole buffer below, overwriting the
+         * probe bytes already sitting in outp. */
+    }
+    size_t result = libdeflate_deflate_compress(c, inp, in_len, outp, out_cap);
+    return (result == 0) ? -1 : (jint) result;
+}
+
 JNIEXPORT jlong JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_allocCompressor(
         JNIEnv *env, jclass clazz, jint level) {
     (void) env;
@@ -34,8 +78,8 @@ JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
     }
 }
 
-/* Returns the compressed length, or a negative value on failure (caller falls
- * back to the JDK Deflater for this entry). */
+/* Returns the compressed length, PZIP_STORE_SENTINEL (-2) when the sniff says
+ * to STORE, or -1 on failure (caller falls back to the JDK Deflater). */
 JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_compress(
         JNIEnv *env, jclass clazz,
         jlong handle,
@@ -57,7 +101,7 @@ JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
         return -1;
     }
 
-    size_t result = libdeflate_deflate_compress(
+    jint rc = pzip_compress_or_store(
             c,
             (const void *) (in + inOff), (size_t) inLen,
             (void *) (out + outOff), (size_t) outCap);
@@ -65,13 +109,7 @@ JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
     (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
     (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
 
-    /* libdeflate returns 0 to mean "output buffer too small"; the Java side
-     * sizes the buffer with a conservative bound, so this should not happen
-     * in practice, but fall back cleanly if it ever does. */
-    if (result == 0) {
-        return -1;
-    }
-    return (jint) result;
+    return rc;
 }
 
 /*
@@ -81,8 +119,10 @@ JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
  * ParallelZipWriter.Sink); previously each entry still paid its own JNI call
  * overhead and critical-array pin/unpin pair. This collapses that to one call
  * for the whole batch. outLens[i] receives the compressed length for entry i,
- * or a negative value if that individual entry failed and needs a JDK
- * Deflater fallback -- one failure never aborts the rest of the batch.
+ * PZIP_STORE_SENTINEL (-2) if the sniff says to STORE it, or -1 if that entry
+ * failed and needs a JDK Deflater fallback -- one failure never aborts the
+ * rest of the batch. (Batched entries are small, so in practice the sniff
+ * never fires here; the shared helper keeps the two paths consistent anyway.)
  */
 JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_compressBatch(
         JNIEnv *env, jclass clazz,
@@ -114,11 +154,10 @@ JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
             }
             lens[i] = -1;
         } else {
-            size_t result = libdeflate_deflate_compress(
+            lens[i] = pzip_compress_or_store(
                     c, (const void *) in, (size_t) inLen, (void *) out, (size_t) outCap);
             (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
             (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
-            lens[i] = (result == 0) ? -1 : (jint) result;
         }
 
         (*env)->DeleteLocalRef(env, inArr);
