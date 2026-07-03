@@ -37,10 +37,10 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'io.github.kukis13.parallel-zip' version '1.1.0'
+    id 'com.ljarocki.parallel-zip' version '1.1.0'
 }
 
-tasks.register('dist', io.github.kukis13.parallelzip.ParallelZip) {
+tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {
     into('myapp-1.0') {
         from 'build/staging'
         from(configurations.runtimeClasspath) { into 'lib' }

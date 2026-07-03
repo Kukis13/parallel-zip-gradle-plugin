@@ -32,8 +32,8 @@ gradlePlugin {
     vcsUrl = 'https://github.com/kukis13/parallel-zip-gradle-plugin.git'
     plugins {
         parallelZip {
-            id = 'io.github.kukis13.parallel-zip'
-            implementationClass = 'io.github.kukis13.parallelzip.ParallelZipPlugin'
+            id = 'com.ljarocki.parallel-zip'
+            implementationClass = 'com.ljarocki.parallelzip.ParallelZipPlugin'
             displayName = 'Parallel Zip'
             description = 'A multithreaded, reproducible drop-in for slow Zip tasks. ' +
                     'Compresses entries across all cores (DEFLATE) or STOREs them for maximum speed.'

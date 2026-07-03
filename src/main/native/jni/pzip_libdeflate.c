@@ -58,7 +58,7 @@ static jint pzip_compress_or_store(struct libdeflate_compressor *c,
     return (result == 0) ? -1 : (jint) result;
 }
 
-JNIEXPORT jlong JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_allocCompressor(
+JNIEXPORT jlong JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_allocCompressor(
         JNIEnv *env, jclass clazz, jint level) {
     (void) env;
     (void) clazz;
@@ -68,7 +68,7 @@ JNIEXPORT jlong JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNa
     return (jlong) (intptr_t) c;
 }
 
-JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_freeCompressor(
+JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_freeCompressor(
         JNIEnv *env, jclass clazz, jlong handle) {
     (void) env;
     (void) clazz;
@@ -80,7 +80,7 @@ JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
 
 /* Returns the compressed length, PZIP_STORE_SENTINEL (-2) when the sniff says
  * to STORE, or -1 on failure (caller falls back to the JDK Deflater). */
-JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_compress(
+JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compress(
         JNIEnv *env, jclass clazz,
         jlong handle,
         jbyteArray inArr, jint inOff, jint inLen,
@@ -124,7 +124,7 @@ JNIEXPORT jint JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNat
  * rest of the batch. (Batched entries are small, so in practice the sniff
  * never fires here; the shared helper keeps the two paths consistent anyway.)
  */
-JNIEXPORT void JNICALL Java_io_github_kukis13_parallelzip_internal_LibdeflateNative_compressBatch(
+JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compressBatch(
         JNIEnv *env, jclass clazz,
         jlong handle, jobjectArray ins, jobjectArray outs, jintArray outLensArr, jint count) {
     (void) clazz;

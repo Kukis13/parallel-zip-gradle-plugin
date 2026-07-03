@@ -1,4 +1,4 @@
-package io.github.kukis13.parallelzip.internal;
+package com.ljarocki.parallelzip.internal;
 
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.internal.file.copy.CopyActionProcessingStream;

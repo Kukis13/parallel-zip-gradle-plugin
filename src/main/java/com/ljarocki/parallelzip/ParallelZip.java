@@ -1,7 +1,7 @@
-package io.github.kukis13.parallelzip;
+package com.ljarocki.parallelzip;
 
-import io.github.kukis13.parallelzip.internal.ParallelZipCopyAction;
-import io.github.kukis13.parallelzip.internal.ParallelZipWriter;
+import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
+import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.provider.Property;
 import org.gradle.api.tasks.Input;

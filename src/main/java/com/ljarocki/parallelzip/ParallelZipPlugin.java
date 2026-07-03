@@ -1,4 +1,4 @@
-package io.github.kukis13.parallelzip;
+package com.ljarocki.parallelzip;
 
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
@@ -8,9 +8,9 @@ import org.gradle.api.Project;
  * script. It intentionally registers no tasks of its own; declare your own:
  *
  * <pre>
- * plugins { id 'io.github.kukis13.parallel-zip' }
+ * plugins { id 'com.ljarocki.parallel-zip' }
  *
- * tasks.register('dist', io.github.kukis13.parallelzip.ParallelZip) {
+ * tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {
  *     from = layout.buildDirectory.dir('staging')
  *     archiveFile = layout.buildDirectory.file('dist.zip')
  * }

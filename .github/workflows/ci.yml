@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
           echo "Found native accelerator: $nativePath ($(stat -c%s "$nativePath") bytes)"
-          report="build/test-results/test/TEST-io.github.kukis13.parallelzip.internal.LibdeflateNativeTest.xml"
+          report="build/test-results/test/TEST-com.ljarocki.parallelzip.internal.LibdeflateNativeTest.xml"
           skipped=$(grep -o 'skipped="[0-9]*"' "$report" | head -1 | grep -o '[0-9]*')
           if [ "$skipped" != "0" ]; then
             echo "::error::LibdeflateNativeTest tests were skipped on ${classifier} -- the native path was not exercised"

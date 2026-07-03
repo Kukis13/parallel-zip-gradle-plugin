@@ -1,4 +1,4 @@
-package io.github.kukis13.parallelzip.internal;
+package com.ljarocki.parallelzip.internal;
 
 import java.io.IOException;
 import java.io.InputStream;

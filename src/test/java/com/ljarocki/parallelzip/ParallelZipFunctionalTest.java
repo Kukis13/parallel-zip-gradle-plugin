@@ -1,4 +1,4 @@
-package io.github.kukis13.parallelzip;
+package com.ljarocki.parallelzip;
 
 import org.gradle.testkit.runner.BuildResult;
 import org.gradle.testkit.runner.GradleRunner;
@@ -33,8 +33,8 @@ class ParallelZipFunctionalTest {
 
     private void buildFile(String taskBody) throws IOException {
         Files.writeString(projectDir.resolve("build.gradle"), """
-                plugins { id 'io.github.kukis13.parallel-zip' }
-                import io.github.kukis13.parallelzip.ParallelZip
+                plugins { id 'com.ljarocki.parallel-zip' }
+                import com.ljarocki.parallelzip.ParallelZip
                 import org.apache.tools.ant.filters.ReplaceTokens
                 tasks.register('dist', ParallelZip) {
                     destinationDirectory = layout.buildDirectory
