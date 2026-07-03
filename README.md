@@ -78,7 +78,7 @@ records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
 On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled native
 [libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
-`Deflater` — faster, and within ~0.3% of the same archive size in practice (see
+`Deflater` — faster, and within ~0.5% of the same archive size in practice (see
 [Benchmarks](#benchmarks)). It only covers the in-memory fast path (no streaming API),
 so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or any
 failure loading the native build, falls back to the pure-Java path automatically.
@@ -106,13 +106,13 @@ in **[BENCHMARKS.md](BENCHMARKS.md)**:
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.38 s | 0.42 s (**3.29×**) | 0.39 s (**3.52×**) | 0.12 s (**11.30×**) | +18.6% |
-| Solr 9.7.0 | 2,091 | 308.5 MiB | 6.89 s | 1.95 s (**3.54×**) | 1.80 s (**3.82×**) | 0.63 s (**10.87×**) | +12.4% |
-| SonarQube Community Build 26.6 | 749 | 966.6 MiB | 21.11 s | 6.55 s (**3.22×**) | 6.33 s (**3.33×**) | 1.78 s (**11.88×**) | +9.2% |
+| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.22 s | 0.35 s (**3.49×**) | 0.27 s (**4.55×**) | 0.03 s (**39.23×**) | +18.9% |
+| Solr 9.7.0 | 2,091 | 308.5 MiB | 5.97 s | 1.71 s (**3.49×**) | 1.34 s (**4.46×**) | 0.17 s (**34.32×**) | +12.1% |
+| SonarQube Community Build 26.7-SNAPSHOT | 610 | 927.9 MiB | 17.67 s | 4.32 s (**4.09×**) | 4.13 s (**4.27×**) | 0.45 s (**39.45×**) | +6.5% |
 
-DEFLATE never produces a bigger archive than the baseline in practice, so it's the safe
-default. Use `store = true` only for archives you already know are jar/binary-heavy,
-where the size cost is small and the speedup large.
+DEFLATE trades a small amount of archive size (up to ~0.8%) for a large speed win, so
+it's still the safe default. Use `store = true` only for archives you already know are
+jar/binary-heavy, where the size cost is small and the speedup large.
 
 ## Reproducibility
 
