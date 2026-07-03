@@ -4,7 +4,7 @@ plugins {
     id 'com.gradle.plugin-publish' version '2.1.1'
 }
 
-group = 'io.github.kukis13'
+group = 'com.ljarocki'
 version = '1.1.0'
 
 java {
