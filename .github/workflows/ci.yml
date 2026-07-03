@@ -16,8 +16,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: ubuntu-latest
+            classifier: linux-x64
+            libfile: libpzip_libdeflate.so
+          - runner: ubuntu-24.04-arm
+            classifier: linux-arm64
+            libfile: libpzip_libdeflate.so
+          - runner: windows-latest
+            classifier: windows-x64
+            libfile: pzip_libdeflate.dll
+          - runner: windows-11-arm
+            classifier: windows-arm64
+            libfile: pzip_libdeflate.dll
+          - runner: macos-latest
+            classifier: macos-arm64
+            libfile: libpzip_libdeflate.dylib
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,54 +52,43 @@ jobs:
       # The plugin's own runtime fallback silently swallows a missing/failed native
       # build (correct for end users on unsupported platforms), which means a
       # regression here could otherwise slip through as a plain green build. CI
-      # only ever runs on the two bundled platforms, so it must assert the native
+      # only ever runs on the bundled platforms, so it must assert the native
       # accelerator actually got built and actually got exercised, not just that
       # the overall build succeeded.
       - name: Verify native libdeflate accelerator was built and exercised
         shell: bash
         run: |
           set -e
-          case "${{ matrix.os }}" in
-            ubuntu-latest) classifier=linux-x64; libfile=libpzip_libdeflate.so ;;
-            windows-latest) classifier=windows-x64; libfile=pzip_libdeflate.dll ;;
-          esac
-          nativePath="build/resources/main/natives/${classifier}/${libfile}"
+          nativePath="build/resources/main/natives/${{ matrix.classifier }}/${{ matrix.libfile }}"
           if [ ! -f "$nativePath" ]; then
-            echo "::error::Native libdeflate accelerator was not built for ${classifier} (expected $nativePath)"
+            echo "::error::Native libdeflate accelerator was not built for ${{ matrix.classifier }} (expected $nativePath)"
             exit 1
           fi
-          echo "Found native accelerator: $nativePath ($(stat -c%s "$nativePath") bytes)"
+          # wc -c, not `stat -c%s`: stat's flags differ between GNU (Linux) and BSD (macOS).
+          size=$(wc -c < "$nativePath" | tr -d ' ')
+          echo "Found native accelerator: $nativePath ($size bytes)"
           report="build/test-results/test/TEST-com.ljarocki.parallelzip.internal.LibdeflateNativeTest.xml"
           skipped=$(grep -o 'skipped="[0-9]*"' "$report" | head -1 | grep -o '[0-9]*')
           if [ "$skipped" != "0" ]; then
-            echo "::error::LibdeflateNativeTest tests were skipped on ${classifier} -- the native path was not exercised"
+            echo "::error::LibdeflateNativeTest tests were skipped on ${{ matrix.classifier }} -- the native path was not exercised"
             exit 1
           fi
-          echo "Native libdeflate accelerator verified working on ${classifier}"
+          echo "Native libdeflate accelerator verified working on ${{ matrix.classifier }}"
 
-      - name: Determine native classifier
-        id: native
-        shell: bash
-        run: |
-          case "${{ matrix.os }}" in
-            ubuntu-latest) echo "classifier=linux-x64" >> "$GITHUB_OUTPUT" ;;
-            windows-latest) echo "classifier=windows-x64" >> "$GITHUB_OUTPUT" ;;
-          esac
-
-      # A Linux runner can't produce the Windows binary and vice versa, so each
-      # leg uploads its own native as an artifact; the "assemble" job below
-      # downloads both and packages them into one release jar.
+      # A runner can only produce its own platform's binary, so each leg
+      # uploads its own native as an artifact; the "assemble" job below
+      # downloads all of them and packages them into one release jar.
       - name: Upload native accelerator artifact
         uses: actions/upload-artifact@v4
         with:
-          name: native-${{ steps.native.outputs.classifier }}
-          path: build/resources/main/natives/${{ steps.native.outputs.classifier }}/
+          name: native-${{ matrix.classifier }}
+          path: build/resources/main/natives/${{ matrix.classifier }}/
 
       - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports-${{ matrix.os }}
+          name: test-reports-${{ matrix.classifier }}
           path: build/reports/tests/
           retention-days: 7
 
@@ -109,22 +113,43 @@ jobs:
           name: native-linux-x64
           path: merged-natives/natives/linux-x64
 
+      - name: Download linux-arm64 native
+        uses: actions/download-artifact@v4
+        with:
+          name: native-linux-arm64
+          path: merged-natives/natives/linux-arm64
+
       - name: Download windows-x64 native
         uses: actions/download-artifact@v4
         with:
           name: native-windows-x64
           path: merged-natives/natives/windows-x64
 
-      - name: Verify both platform natives are present
+      - name: Download windows-arm64 native
+        uses: actions/download-artifact@v4
+        with:
+          name: native-windows-arm64
+          path: merged-natives/natives/windows-arm64
+
+      - name: Download macos-arm64 native
+        uses: actions/download-artifact@v4
+        with:
+          name: native-macos-arm64
+          path: merged-natives/natives/macos-arm64
+
+      - name: Verify all platform natives are present
         run: |
           set -e
           test -f merged-natives/natives/linux-x64/libpzip_libdeflate.so || { echo "::error::missing linux-x64 native"; exit 1; }
+          test -f merged-natives/natives/linux-arm64/libpzip_libdeflate.so || { echo "::error::missing linux-arm64 native"; exit 1; }
           test -f merged-natives/natives/windows-x64/pzip_libdeflate.dll || { echo "::error::missing windows-x64 native"; exit 1; }
-          echo "Both platform natives present, ready to bundle into one jar."
+          test -f merged-natives/natives/windows-arm64/pzip_libdeflate.dll || { echo "::error::missing windows-arm64 native"; exit 1; }
+          test -f merged-natives/natives/macos-arm64/libpzip_libdeflate.dylib || { echo "::error::missing macos-arm64 native"; exit 1; }
+          echo "All platform natives present, ready to bundle into one jar."
 
       # Skips compileNativeDeflate: this job only packages the natives already
-      # built and verified by the two matrix legs above, it doesn't recompile.
-      - name: Assemble release jar with both platforms' natives
+      # built and verified by the matrix legs above, it doesn't recompile.
+      - name: Assemble release jar with all platforms' natives
         run: ./gradlew jar -PpzipPrebuiltNativesDir=merged-natives -x compileNativeDeflate --no-daemon --stacktrace
 
       - name: Upload release jar

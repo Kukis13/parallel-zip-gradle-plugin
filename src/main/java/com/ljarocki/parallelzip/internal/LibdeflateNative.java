@@ -7,17 +7,26 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Bindings to a bundled native libdeflate build. libdeflate has no streaming
  * API (whole-buffer in, whole-buffer out), so this is only usable for the
  * in-memory fast path; the spilled/streamed path keeps using the JDK's
- * {@code Deflater}. Only linux-x64 and windows-x64 natives are bundled (the
- * two platforms this project's CI builds and tests); every other platform,
- * or any failure while loading, permanently falls back to pure Java with no
- * behavioural change.
+ * {@code Deflater}. Only linux-x64, linux-arm64, windows-x64, windows-arm64
+ * and macos-arm64 natives are bundled (the platforms this project's CI
+ * builds and tests); every other platform/arch, or any failure while
+ * loading, permanently falls back to pure Java with no behavioural change.
  */
 public final class LibdeflateNative {
+
+    // The only os-arch combos actually built and bundled by CI. Anything else
+    // (macos-x64, linux-riscv64, ...) falls back to pure Java rather than
+    // guessing at a resource path that was never packaged into the jar. Must
+    // be declared before AVAILABLE: its initializer (load() -> resourcePath())
+    // runs at class-init time and needs this already set.
+    private static final Set<String> SUPPORTED_CLASSIFIERS = Set.of(
+            "windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-arm64");
 
     private static final boolean AVAILABLE = load();
 
@@ -102,16 +111,25 @@ public final class LibdeflateNative {
     private static String resourcePath() {
         String osName = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         String archName = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
-        boolean isX64 = archName.equals("amd64") || archName.equals("x86_64");
-        if (!isX64) {
+
+        String os = osName.contains("win") ? "windows"
+                : osName.contains("linux") ? "linux"
+                : (osName.contains("mac") || osName.contains("darwin")) ? "macos"
+                : null;
+        String arch = (archName.equals("amd64") || archName.equals("x86_64")) ? "x64"
+                : (archName.equals("aarch64") || archName.equals("arm64")) ? "arm64"
+                : null;
+        if (os == null || arch == null) {
             return null;
         }
-        if (osName.contains("win")) {
-            return "/natives/windows-x64/pzip_libdeflate.dll";
+
+        String classifier = os + "-" + arch;
+        if (!SUPPORTED_CLASSIFIERS.contains(classifier)) {
+            return null;
         }
-        if (osName.contains("linux")) {
-            return "/natives/linux-x64/libpzip_libdeflate.so";
-        }
-        return null; // macOS and others: pure-Java fallback for now
+        String libFile = os.equals("windows") ? "pzip_libdeflate.dll"
+                : os.equals("macos") ? "libpzip_libdeflate.dylib"
+                : "libpzip_libdeflate.so";
+        return "/natives/" + classifier + "/" + libFile;
     }
 }
