@@ -20,18 +20,25 @@ jobs:
           - runner: ubuntu-latest
             classifier: linux-x64
             libfile: libpzip_libdeflate.so
+            javaDistribution: temurin
           - runner: ubuntu-24.04-arm
             classifier: linux-arm64
             libfile: libpzip_libdeflate.so
+            javaDistribution: temurin
           - runner: windows-latest
             classifier: windows-x64
             libfile: pzip_libdeflate.dll
+            javaDistribution: temurin
           - runner: windows-11-arm
             classifier: windows-arm64
             libfile: pzip_libdeflate.dll
+            # Temurin doesn't publish a windows-arm64 JDK 17 build (only 21+);
+            # Microsoft's OpenJDK distribution does.
+            javaDistribution: microsoft
           - runner: macos-latest
             classifier: macos-arm64
             libfile: libpzip_libdeflate.dylib
+            javaDistribution: temurin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +46,7 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: ${{ matrix.javaDistribution }}
           java-version: '17'
 
       - name: Set up Gradle
