@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'com.ljarocki'
-version = '1.1.0'
+version = '1.2.0'
 
 java {
     toolchain {
@@ -64,17 +64,20 @@ tasks.named('test') {
     systemProperty 'pzip.hugeTest', System.getProperty('pzip.hugeTest', 'false')
 }
 
-// --- Optional native libdeflate accelerator (linux-x64 / windows-x64 only) ---
+// --- Optional native libdeflate accelerator ---
 // Compiled best-effort: if cmake or a C toolchain isn't available, this is skipped
 // with a warning and the plugin falls back to the pure-Java Deflater at runtime,
-// exactly as it does on any other unsupported platform/arch.
+// exactly as it does on any other unsupported platform/arch. Keep this mapping in
+// sync with LibdeflateNative.SUPPORTED_CLASSIFIERS and the ci.yml matrix.
 def nativeClassifier = {
     def os = System.getProperty('os.name', '').toLowerCase()
     def arch = System.getProperty('os.arch', '').toLowerCase()
-    if (arch != 'amd64' && arch != 'x86_64') return null
-    if (os.contains('win')) return 'windows-x64'
-    if (os.contains('linux')) return 'linux-x64'
-    return null
+    def osName = os.contains('win') ? 'windows' : os.contains('linux') ? 'linux' : os.contains('mac') ? 'macos' : null
+    def archName = (arch == 'amd64' || arch == 'x86_64') ? 'x64' : (arch == 'aarch64' || arch == 'arm64') ? 'arm64' : null
+    if (osName == null || archName == null) return null
+    def classifier = "${osName}-${archName}".toString()
+    def supported = ['windows-x64', 'windows-arm64', 'linux-x64', 'linux-arm64', 'macos-arm64']
+    return supported.contains(classifier) ? classifier : null
 }()
 
 def nativeSrcDir = file('src/main/native')

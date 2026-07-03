@@ -76,12 +76,14 @@ Archives beyond the standard ZIP limits — over 4 GiB, over 65,535 entries, or 
 offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields and end-of-central-directory
 records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
-On `linux-x64` and `windows-x64`, small-entry DEFLATE runs through a bundled native
+On `linux-x64`, `linux-arm64`, `windows-x64`, `windows-arm64` and `macos-arm64`,
+small-entry DEFLATE runs through a bundled native
 [libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
 `Deflater` — faster, and within ~0.5% of the same archive size in practice (see
 [Benchmarks](#benchmarks)). It only covers the in-memory fast path (no streaming API),
-so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or any
-failure loading the native build, falls back to the pure-Java path automatically.
+so large/spilled entries still use the JDK `Deflater`. Every other platform/arch
+(including Intel Macs), or any failure loading the native build, falls back to the
+pure-Java path automatically.
 
 Two more optimizations for archives with lots of small entries, both always on with no
 configuration needed:
