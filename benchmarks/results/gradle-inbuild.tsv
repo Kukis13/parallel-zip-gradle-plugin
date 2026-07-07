@@ -1,0 +1,12 @@
+project	task	baselineMs	parallelMs	baselineBytes	parallelBytes	notes
+SonarQube	:sonar-application:zip	29557	11134	926556100	934826730	real 927MB product distro
+Groovy	:groovy-binary:distBin	1140	218	29997515	30004046	real 30MB product distro
+Spring Boot CLI	:cli:spring-boot-cli:zip	348	141	7347896	?	overwrote same filename (configureArchive resets classifier), size not captured separately
+Gradle (the tool)	:distributions-full:binDistributionZip	4636	1032	?	?	measured via doFirst/doLast (config cache + isolated projects block --profile)
+JBang	:distZip	411	200	13176985	13138157	real 13MB product distro
+JBake	:jbake-dist:distZip	2363	330	90670297	90890577	real 90MB product distro (incl. cloned example project zips)
+Micronaut Starter CLI	:micronaut-cli:distZip	911	117	32676360	34311579	real 33MB product distro
+Gradle Profiler	:distZip	839	169	35241668	35161501	real 35MB product distro
+Corda	buildCordappDependenciesZip	SKIPPED	SKIPPED	-	-	task is broken on current HEAD (resolves non-resolvable testImplementation config), pre-existing bug unrelated to parallel-zip
+Grails CLI	:grails-cli:distZip	1286	621	55505741	55372409	real 55MB product distro
+Kotlin/Native	distNativeSources / samplesZip	SKIPPED	SKIPPED	-	-	Kotlin/Native compiler build too heavy to finish in reasonable time

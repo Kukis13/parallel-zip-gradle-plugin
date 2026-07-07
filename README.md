@@ -102,18 +102,24 @@ measured (see [Benchmarks](#benchmarks)).
 
 ## Benchmarks
 
-A few highlights from real open-source projects — full 11-project table and methodology
-in **[BENCHMARKS.md](BENCHMARKS.md)**:
+The most direct evidence: clone a real project, add a `ParallelZip` twin of its actual
+production `Zip` task, and diff the two tasks' own execution time with everything else
+in the build warm/cached. Full methodology, all rows, and the fixed-corpus (static
+directory tree, four codecs) benchmarks in **[BENCHMARKS.md](BENCHMARKS.md)**:
 
-| Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| Cassandra 4.1.7 | 200 | 57.5 MiB | 1.22 s | 0.35 s (**3.49×**) | 0.27 s (**4.55×**) | 0.03 s (**39.23×**) | +18.9% |
-| Solr 9.7.0 | 2,091 | 308.5 MiB | 5.97 s | 1.71 s (**3.49×**) | 1.34 s (**4.46×**) | 0.17 s (**34.32×**) | +12.1% |
-| SonarQube Community Build 26.7-SNAPSHOT | 610 | 927.9 MiB | 17.67 s | 4.32 s (**4.09×**) | 4.13 s (**4.27×**) | 0.45 s (**39.45×**) | +6.5% |
+| Project | Task | Stock `Zip` | `ParallelZip` | Speedup |
+|---|---|--:|--:|--:|
+| Micronaut Starter (Launch) CLI | `distZip` | 0.911 s | 0.117 s | **7.79×** |
+| JBake | `jbake-dist:distZip` | 2.363 s | 0.330 s | **7.16×** |
+| Groovy 4.0.24 | `groovy-binary:distBin` | 1.140 s | 0.218 s | **5.23×** |
+| SonarQube 26.6 | `sonar-application:zip` | 29.557 s | 11.134 s | **2.66×** |
+| JBang | `distZip` | 0.411 s | 0.200 s | **2.06×** |
 
-DEFLATE trades a small amount of archive size (up to ~0.8%) for a large speed win, so
-it's still the safe default. Use `store = true` only for archives you already know are
-jar/binary-heavy, where the size cost is small and the speedup large.
+Average speedup across nine real production Zip tasks measured this way: **4.32×**.
+Archive sizes matched within ~1% of the stock task in every case — DEFLATE trades a
+small amount of archive size for a large speed win, so it's still the safe default. Use
+`store = true` only for archives you already know are jar/binary-heavy, where the size
+cost is small and the speedup large.
 
 ## Reproducibility
 

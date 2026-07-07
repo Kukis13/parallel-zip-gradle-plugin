@@ -1,8 +1,71 @@
 # Benchmarks
 
-Eleven popular open-source Java projects' official binary distributions, archived four
-ways — Gradle `Zip` (baseline), `parallel-zip` DEFLATE (JDK codec), DEFLATE
-(libdeflate), and STORE. Same machine: 12 logical cores, JDK 21, warm cache.
+## In-build benchmarks (real projects, real Zip tasks)
+
+The most direct evidence for this plugin isn't archiving a static directory tree — it's
+what happens when you actually swap `type: Zip` for `type: ParallelZip` in a real
+project's real build. For each project below: clone it, build once with its stock `Zip`
+task, add a second task with identical configuration but `ParallelZip`, then build again
+and diff the two tasks' own execution time (via Gradle's `--profile` report, or
+`doFirst`/`doLast` timing hooks when `--profile` wasn't available — see notes).
+Everything else in the build (compilation, resource processing, dependency resolution)
+was warm/cached in both runs, so only the archiving step itself is being compared. Same
+machine: 12 logical cores, JDK 17/21/25 (whichever each project's build required).
+
+| Project | Task | Stock `Zip` | `ParallelZip` | Speedup |
+|---|---|--:|--:|--:|
+| Micronaut Starter (Launch) CLI | `distZip` | 0.911 s | 0.117 s | **7.79×** |
+| JBake | `jbake-dist:distZip` | 2.363 s | 0.330 s | **7.16×** |
+| Groovy 4.0.24 | `groovy-binary:distBin` | 1.140 s | 0.218 s | **5.23×** |
+| Gradle Profiler | `distZip` | 0.839 s | 0.169 s | **4.96×** |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.636 s | 1.032 s | **4.49×** |
+| SonarQube 26.6 | `sonar-application:zip` | 29.557 s | 11.134 s | **2.66×** |
+| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.348 s | 0.141 s | **2.47×** |
+| Grails CLI | `grails-cli:distZip` | 1.286 s | 0.621 s | **2.07×** |
+| JBang | `distZip` | 0.411 s | 0.200 s | **2.06×** |
+
+Average speedup across these nine real production Zip tasks: **4.32×**. Archive sizes
+matched within ~1% between the stock and parallel runs in every case (see
+`benchmarks/results/gradle-inbuild.tsv` for the raw byte counts) — the small deltas are
+expected DEFLATE-codec variance (native libdeflate vs. the JDK `Deflater`), not missing
+content.
+
+Three projects from the original candidate list were dropped rather than forced in:
+
+- **Corda**'s only `Zip`-typed task (`buildCordappDependenciesZip`) is broken on the
+  current `master` branch independent of this plugin — it resolves a
+  non-resolvable `testImplementation` configuration, a pre-existing bug unrelated to
+  `parallel-zip`.
+- **Kotlin/Native**'s candidate tasks (`distNativeSources`, `samplesZip`) sit behind the
+  Kotlin/Native compiler's own build, one of the heaviest in the OSS Gradle ecosystem —
+  it didn't finish in a reasonable amount of time on this machine.
+- Every other candidate project investigated (Kafka, Solr, Elasticsearch, Micronaut Core,
+  Apache Beam, OkHttp, Ktor, ktlint, Nextflow, Ratpack, JReleaser, Netflix Eureka,
+  Spinnaker Orca, …) either ships a `.tar`/`.tar.gz` distribution instead of a `.zip`
+  (this plugin is ZIP-specific), has no distribution-archiving task at all (pure
+  libraries), or buries its real archive task inside custom internal Java-based Gradle
+  plugin code (e.g. Elasticsearch) rather than a plain `Zip` task, which was judged too
+  invasive to safely duplicate.
+
+Notes on measurement method per row:
+
+- **Gradle (the tool)** enables Isolated Projects, which forces configuration cache on
+  and configuration cache doesn't support `--profile`; timed with `doFirst`/`doLast`
+  `System.nanoTime()` hooks instead.
+- **JBake**'s `--profile` report failed to write for an unrelated environment reason
+  (`Unable to create directory 'reports\profile'`) on this machine; also timed with
+  `doFirst`/`doLast` hooks.
+- **Grails CLI** and **Micronaut Starter CLI** required specific JDKs (17 and 25
+  respectively) to satisfy their own build's toolchain requirements — unrelated to
+  `parallel-zip`.
+
+## Fixed-corpus benchmarks (static directory tree, four codecs)
+
+An earlier, complementary methodology: eleven popular open-source Java projects'
+official binary distributions, archived four ways — Gradle `Zip` (baseline),
+`parallel-zip` DEFLATE (JDK codec), DEFLATE (libdeflate), and STORE — using a fixed
+staging directory so only the archiving algorithm varies, not each project's own
+compile/download chain. Same machine: 12 logical cores, JDK 21, warm cache.
 
 | Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
 |---|--:|--:|--:|--:|--:|--:|--:|
