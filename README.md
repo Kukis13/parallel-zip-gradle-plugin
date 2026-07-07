@@ -76,14 +76,13 @@ Archives beyond the standard ZIP limits — over 4 GiB, over 65,535 entries, or 
 offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields and end-of-central-directory
 records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
-On `linux-x64`, `linux-arm64`, `windows-x64`, `windows-arm64` and `macos-arm64`,
-small-entry DEFLATE runs through a bundled native
+On `linux-x64`, `linux-arm64`, `windows-x64`, `windows-arm64`, `macos-arm64` and
+`macos-x64`, small-entry DEFLATE runs through a bundled native
 [libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
 `Deflater` — faster, and within ~0.5% of the same archive size in practice (see
 [Benchmarks](#benchmarks)). It only covers the in-memory fast path (no streaming API),
-so large/spilled entries still use the JDK `Deflater`. Every other platform/arch
-(including Intel Macs), or any failure loading the native build, falls back to the
-pure-Java path automatically.
+so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or
+any failure loading the native build, falls back to the pure-Java path automatically.
 
 Two more optimizations for archives with lots of small entries, both always on with no
 configuration needed:
@@ -125,7 +124,7 @@ resolved copy order, honouring `reproducibleFileOrder`), so scheduling never aff
 bytes. For fully reproducible builds also ensure identical file **contents** and the same
 **JDK** (the DEFLATE codec must match); `store = true` sidesteps the codec dependency.
 The native libdeflate accelerator is an additional codec dependency on top of the JDK:
-builds on `linux-x64`/`windows-x64` use it, builds elsewhere fall back to the JDK
+builds on the six platforms listed above use it, builds elsewhere fall back to the JDK
 `Deflater`, so byte-identical output across *different platforms* also requires both
 sides to have (or both lack) the native accelerator — same-platform reproducibility is
 unaffected either way.

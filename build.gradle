@@ -76,7 +76,7 @@ def nativeClassifier = {
     def archName = (arch == 'amd64' || arch == 'x86_64') ? 'x64' : (arch == 'aarch64' || arch == 'arm64') ? 'arm64' : null
     if (osName == null || archName == null) return null
     def classifier = "${osName}-${archName}".toString()
-    def supported = ['windows-x64', 'windows-arm64', 'linux-x64', 'linux-arm64', 'macos-arm64']
+    def supported = ['windows-x64', 'windows-arm64', 'linux-x64', 'linux-arm64', 'macos-arm64', 'macos-x64']
     return supported.contains(classifier) ? classifier : null
 }()
 

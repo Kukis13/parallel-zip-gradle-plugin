@@ -39,6 +39,11 @@ jobs:
             classifier: macos-arm64
             libfile: libpzip_libdeflate.dylib
             javaDistribution: temurin
+          # macos-latest is arm64-only; macos-13 is GitHub's last Intel runner image.
+          - runner: macos-13
+            classifier: macos-x64
+            libfile: libpzip_libdeflate.dylib
+            javaDistribution: temurin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +149,12 @@ jobs:
           name: native-macos-arm64
           path: merged-natives/natives/macos-arm64
 
+      - name: Download macos-x64 native
+        uses: actions/download-artifact@v4
+        with:
+          name: native-macos-x64
+          path: merged-natives/natives/macos-x64
+
       - name: Verify all platform natives are present
         run: |
           set -e
@@ -152,6 +163,7 @@ jobs:
           test -f merged-natives/natives/windows-x64/pzip_libdeflate.dll || { echo "::error::missing windows-x64 native"; exit 1; }
           test -f merged-natives/natives/windows-arm64/pzip_libdeflate.dll || { echo "::error::missing windows-arm64 native"; exit 1; }
           test -f merged-natives/natives/macos-arm64/libpzip_libdeflate.dylib || { echo "::error::missing macos-arm64 native"; exit 1; }
+          test -f merged-natives/natives/macos-x64/libpzip_libdeflate.dylib || { echo "::error::missing macos-x64 native"; exit 1; }
           echo "All platform natives present, ready to bundle into one jar."
 
       # Skips compileNativeDeflate: this job only packages the natives already

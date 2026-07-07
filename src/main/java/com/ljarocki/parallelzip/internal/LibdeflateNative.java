@@ -13,20 +13,20 @@ import java.util.Set;
  * Bindings to a bundled native libdeflate build. libdeflate has no streaming
  * API (whole-buffer in, whole-buffer out), so this is only usable for the
  * in-memory fast path; the spilled/streamed path keeps using the JDK's
- * {@code Deflater}. Only linux-x64, linux-arm64, windows-x64, windows-arm64
- * and macos-arm64 natives are bundled (the platforms this project's CI
- * builds and tests); every other platform/arch, or any failure while
+ * {@code Deflater}. Only linux-x64, linux-arm64, windows-x64, windows-arm64,
+ * macos-arm64 and macos-x64 natives are bundled (the platforms this project's
+ * CI builds and tests); every other platform/arch, or any failure while
  * loading, permanently falls back to pure Java with no behavioural change.
  */
 public final class LibdeflateNative {
 
     // The only os-arch combos actually built and bundled by CI. Anything else
-    // (macos-x64, linux-riscv64, ...) falls back to pure Java rather than
-    // guessing at a resource path that was never packaged into the jar. Must
-    // be declared before AVAILABLE: its initializer (load() -> resourcePath())
-    // runs at class-init time and needs this already set.
+    // (e.g. linux-riscv64) falls back to pure Java rather than guessing at a
+    // resource path that was never packaged into the jar. Must be declared
+    // before AVAILABLE: its initializer (load() -> resourcePath()) runs at
+    // class-init time and needs this already set.
     private static final Set<String> SUPPORTED_CLASSIFIERS = Set.of(
-            "windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-arm64");
+            "windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-arm64", "macos-x64");
 
     private static final boolean AVAILABLE = load();
 
