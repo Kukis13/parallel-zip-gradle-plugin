@@ -77,12 +77,16 @@ offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields and end-of-c
 records, validated against both `java.util.zip` and a non-Java (.NET) reader.
 
 On `linux-x64`, `linux-arm64`, `windows-x64`, `windows-arm64`, `macos-arm64` and
-`macos-x64`, small-entry DEFLATE runs through a bundled native
+`macos-x64`, DEFLATE runs through a bundled native
 [libdeflate](https://github.com/ebiggers/libdeflate) build instead of the JDK's
 `Deflater` — faster, and within ~0.5% of the same archive size in practice (see
-[Benchmarks](#benchmarks)). It only covers the in-memory fast path (no streaming API),
-so large/spilled entries still use the JDK `Deflater`. Every other platform/arch, or
-any failure loading the native build, falls back to the pure-Java path automatically.
+[Benchmarks](#benchmarks)). Small entries are compressed straight from a JVM byte array;
+large entries (above 8 MiB, up to 128 MiB) are compressed straight from a memory-mapped
+view of the source file instead, with no `Files.readAllBytes` copy in between. Either
+way, CRC-32 is computed natively in the same pass as compression, not as a separate scan.
+libdeflate has no streaming API, so only entries past 128 MiB still stream through the
+JDK `Deflater`. Every other platform/arch, or any failure loading the native build or
+memory-mapping the file, falls back to the pure-Java path automatically.
 
 Two more optimizations for archives with lots of small entries, both always on with no
 configuration needed:
@@ -128,12 +132,6 @@ builds on the six platforms listed above use it, builds elsewhere fall back to t
 `Deflater`, so byte-identical output across *different platforms* also requires both
 sides to have (or both lack) the native accelerator — same-platform reproducibility is
 unaffected either way.
-
-## Roadmap
-
-- Zero-copy (mmap) reads for large entries, feeding the native accelerator directly
-  instead of copying through a JVM byte array.
-- Fuse CRC32 computation into the same buffer pass as compression instead of two scans.
 
 ## Contributing
 

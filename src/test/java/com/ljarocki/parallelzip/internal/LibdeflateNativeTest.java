@@ -39,9 +39,11 @@ class LibdeflateNativeTest {
         long handle = alloc(6);
         try {
             byte[] out = new byte[input.length + (input.length >> 12) + 64];
-            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, out.length);
+            long[] crcOut = new long[1];
+            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, out.length, crcOut);
             assertEquals(LibdeflateNative.STORE_SENTINEL, n,
                     "the incompressibility sniff must flag a large random buffer for STORE");
+            assertEquals(expectedCrc(input), crcOut[0], "crcOut must be set even when the sniff STOREs the entry");
         } finally {
             LibdeflateNative.freeCompressor(handle);
         }
@@ -56,9 +58,11 @@ class LibdeflateNativeTest {
         try {
             int cap = input.length + (input.length >> 12) + 64;
             byte[] out = new byte[cap];
-            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap);
+            long[] crcOut = new long[1];
+            int n = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap, crcOut);
             assertTrue(n > 0, "input under the sniff threshold must be compressed, not sniffed to STORE");
             assertRoundTrips(input, out, n);
+            assertEquals(expectedCrc(input), crcOut[0], "native CRC-32 must match java.util.zip.CRC32");
         } finally {
             LibdeflateNative.freeCompressor(handle);
         }
@@ -87,8 +91,10 @@ class LibdeflateNativeTest {
         long handle = alloc(6);
         try {
             byte[] out = new byte[64];
-            int n = LibdeflateNative.compress(handle, new byte[0], 0, 0, out, 0, out.length);
+            long[] crcOut = new long[1];
+            int n = LibdeflateNative.compress(handle, new byte[0], 0, 0, out, 0, out.length, crcOut);
             assertTrue(n >= 0, "empty input must not fail or crash");
+            assertEquals(0L, crcOut[0], "CRC-32 of empty input must be 0");
         } finally {
             LibdeflateNative.freeCompressor(handle);
         }
@@ -125,11 +131,54 @@ class LibdeflateNativeTest {
                 outs[i] = new byte[input.length + (input.length >> 12) + 64];
             }
             int[] outLens = new int[n];
-            LibdeflateNative.compressBatch(handle, ins, outs, outLens, n);
+            long[] crcs = new long[n];
+            LibdeflateNative.compressBatch(handle, ins, outs, outLens, crcs, n);
             for (int i = 0; i < n; i++) {
                 assertTrue(outLens[i] > 0, "entry " + i + " must compress successfully in a batch call");
                 assertRoundTrips(ins[i], outs[i], outLens[i]);
+                assertEquals(expectedCrc(ins[i]), crcs[i], "entry " + i + " CRC-32 mismatch");
             }
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
+    @Test
+    void compressDirectFromMappedFileMatchesHeapCompression() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        byte[] input = "The quick brown fox jumps over the lazy dog. ".repeat(20_000)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("pzip-direct-", ".bin");
+        try {
+            java.nio.file.Files.write(tmp, input);
+            long handle = alloc(6);
+            try (var ch = java.nio.channels.FileChannel.open(tmp, java.nio.file.StandardOpenOption.READ)) {
+                java.nio.MappedByteBuffer mapped = ch.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, input.length);
+                int cap = input.length + (input.length >> 12) + 64;
+                byte[] out = new byte[cap];
+                long[] crcOut = new long[1];
+                int n = LibdeflateNative.compressDirect(handle, mapped, input.length, out, 0, cap, crcOut);
+                assertTrue(n > 0 && n < input.length, "should compress well below the input size");
+                assertRoundTrips(input, out, n);
+                assertEquals(expectedCrc(input), crcOut[0], "mmap'd CRC-32 must match java.util.zip.CRC32");
+            } finally {
+                LibdeflateNative.freeCompressor(handle);
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void compressDirectRejectsNonDirectBuffer() {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        long handle = alloc(6);
+        try {
+            java.nio.ByteBuffer heap = java.nio.ByteBuffer.allocate(64); // not direct
+            byte[] out = new byte[128];
+            long[] crcOut = new long[1];
+            int n = LibdeflateNative.compressDirect(handle, heap, 64, out, 0, out.length, crcOut);
+            assertTrue(n <= 0, "a non-direct buffer must fail cleanly, not crash");
         } finally {
             LibdeflateNative.freeCompressor(handle);
         }
@@ -145,10 +194,18 @@ class LibdeflateNativeTest {
     private static int compress(long handle, byte[] input) throws Exception {
         int cap = input.length + (input.length >> 12) + 64;
         byte[] out = new byte[cap];
-        int compLen = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap);
+        long[] crcOut = new long[1];
+        int compLen = LibdeflateNative.compress(handle, input, 0, input.length, out, 0, cap, crcOut);
         assertTrue(compLen > 0, "native compress must succeed");
         assertRoundTrips(input, out, compLen);
+        assertEquals(expectedCrc(input), crcOut[0], "native CRC-32 must match java.util.zip.CRC32");
         return compLen;
+    }
+
+    private static long expectedCrc(byte[] input) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(input);
+        return crc.getValue();
     }
 
     private static void assertRoundTrips(byte[] input, byte[] out, int compLen) throws Exception {

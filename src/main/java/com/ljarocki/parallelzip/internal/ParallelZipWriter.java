@@ -8,9 +8,12 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -36,10 +39,12 @@ import java.util.zip.Deflater;
  * regardless of thread count. With fixed timestamps the archive is byte-for-byte
  * reproducible across rebuilds of identical content.</p>
  *
- * <p>Small entries are compressed in memory; entries larger than {@link #SPILL_THRESHOLD}
- * are streamed through the deflater to a temp file so a single entry may be arbitrarily
- * large. ZIP64 is emitted automatically for archives &gt; 4 GiB, more than 65,535 entries,
- * or per-entry sizes/offsets beyond 4 GiB.</p>
+ * <p>Small entries are compressed in memory; entries larger than {@link #SPILL_THRESHOLD} are
+ * mapped straight from the source file into the native accelerator (see
+ * {@link #MMAP_THRESHOLD}) when one is available, or otherwise streamed through the JDK
+ * deflater to a temp file, so a single entry may be arbitrarily large either way. ZIP64 is
+ * emitted automatically for archives &gt; 4 GiB, more than 65,535 entries, or per-entry
+ * sizes/offsets beyond 4 GiB.</p>
  */
 public final class ParallelZipWriter {
 
@@ -56,6 +61,16 @@ public final class ParallelZipWriter {
     static final int MAX16 = 0xFFFF;
     /** Entries larger than this are streamed (spilled) instead of held in memory. */
     public static final long SPILL_THRESHOLD = 8L << 20; // 8 MiB
+    /**
+     * Spilled entries up to this size are still compressed via the native libdeflate
+     * accelerator, fed directly from a memory-mapped view of the source file instead of a
+     * {@code Files.readAllBytes} heap copy (see {@link #tryMmapNativeDeflate}). Bounded well
+     * under the ~2 GiB {@link FileChannel#map} limit, and under this an entry's compressed
+     * output buffer is comfortably a fraction of the {@code Sink} in-memory byte budget.
+     * Entries beyond this always use the plain streaming JDK {@link Deflater} path, which has
+     * no size limit.
+     */
+    static final long MMAP_THRESHOLD = 128L << 20; // 128 MiB
     static final int STREAM_BUF = 1 << 16;
 
     // Fixed DOS date/time used when timestamps are not preserved: 1980-01-01 00:00:00.
@@ -181,6 +196,10 @@ public final class ParallelZipWriter {
         // which every native call site treats as "unavailable, use the JDK Deflater".
         private final ThreadLocal<Long> nativeHandles;
         private final ConcurrentLinkedQueue<Long> allocatedNativeHandles = new ConcurrentLinkedQueue<>();
+        // Mirrors the condition nativeHandles' initializer uses, so permitsFor (called from
+        // the producer thread, before any worker thread has touched nativeHandles) can budget
+        // for the mmap fast path without allocating a compressor just to check.
+        private final boolean useNative;
         private final Semaphore countFlight;   // bounds the NUMBER of in-flight entries
         private final Semaphore byteFlight;     // bounds in-memory BYTES held (in MiB units)
         private final int budgetMiB;
@@ -221,7 +240,7 @@ public final class ParallelZipWriter {
             this.spillDir = spillDir;
             this.pool = Executors.newFixedThreadPool(threads);
             this.deflaters = ThreadLocal.withInitial(() -> new Deflater(level, true));
-            boolean useNative = !store && LibdeflateNative.available();
+            this.useNative = !store && LibdeflateNative.available();
             this.nativeHandles = ThreadLocal.withInitial(() -> {
                 if (!useNative) return 0L;
                 long h = allocNativeCompressor(level);
@@ -300,12 +319,18 @@ public final class ParallelZipWriter {
         }
 
         private int permitsFor(Entry e) {
-            long mem;
-            if (e.inline != null) mem = e.size;
-            else if (e.file != null && e.size <= spillThreshold) mem = e.size; // read into a byte[]
-            else return 0; // directory, or large entry that streams via a temp file
-            if (!store) mem *= 2; // raw + compressed buffer resident together
-            return (int) Math.max(1, Math.min(budgetMiB, (mem + MIB - 1) / MIB));
+            if (e.inline != null || (e.file != null && e.size <= spillThreshold)) {
+                long mem = e.size; // read into a byte[]
+                if (!store) mem *= 2; // raw + compressed buffer resident together
+                return (int) Math.max(1, Math.min(budgetMiB, (mem + MIB - 1) / MIB));
+            }
+            if (e.file != null && useNative && e.size <= MMAP_THRESHOLD) {
+                // The mmap fast path (tryMmapNativeDeflate) never materializes the input as a
+                // byte[] -- it's a page-cache-backed mapping, not heap memory -- so only the
+                // one compressed-output buffer counts against the budget, not 2x.
+                return (int) Math.max(1, Math.min(budgetMiB, (e.size + MIB - 1) / MIB));
+            }
+            return 0; // directory, or large entry that streams via a temp file
         }
 
         public Result finish() throws IOException, InterruptedException {
@@ -437,15 +462,11 @@ public final class ParallelZipWriter {
     private static List<Compressed> compressBatchNative(List<Entry> batch, Deflater def, long nativeHandle) {
         int n = batch.size();
         byte[][] raws = new byte[n][];
-        long[] crcs = new long[n];
         byte[][] outs = new byte[n][];
         boolean[] empty = new boolean[n];
         for (int i = 0; i < n; i++) {
             byte[] raw = readSmallEntry(batch.get(i));
             raws[i] = raw;
-            CRC32 crc = new CRC32();
-            crc.update(raw);
-            crcs[i] = crc.getValue();
             empty[i] = raw.length == 0;
             // A distinct (not aliased) array even when empty: passing the same array
             // object as both input and output would pin it twice under
@@ -453,20 +474,25 @@ public final class ParallelZipWriter {
             outs[i] = empty[i] ? new byte[0] : new byte[raw.length + (raw.length >> 12) + 64];
         }
 
+        // CRC-32 is computed natively, per entry, in the same pinned-array pass as
+        // compression (see pzip_libdeflate.c) instead of a dedicated Java CRC32.update
+        // loop over every raw[] beforehand.
         int[] outLens = new int[n];
-        LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, n);
+        long[] crcs = new long[n];
+        LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, crcs, n);
 
         List<Compressed> result = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             Entry e = batch.get(i);
             byte[] raw = raws[i];
             if (empty[i]) {
-                result.add(new Compressed(e, raw, null, false, crcs[i], 0, 0, 0));
+                result.add(new Compressed(e, raw, null, false, 0L, 0, 0, 0)); // CRC-32 of empty input is 0
             } else if (outLens[i] == LibdeflateNative.STORE_SENTINEL || outLens[i] >= raw.length) {
                 // sniff judged it already-compressed, or deflate didn't help: store this entry
                 result.add(new Compressed(e, raw, null, false, crcs[i], raw.length, raw.length, 0));
             } else if (outLens[i] <= 0) {
-                result.add(compressWithJdk(e, raw, def, crcs[i])); // native failed: JDK fallback
+                // native failed: JDK fallback, reusing the CRC the native call already computed
+                result.add(compressWithJdk(e, raw, def, crcs[i]));
             } else {
                 result.add(new Compressed(e, outs[i], null, false, crcs[i], raw.length, outLens[i], 8));
             }
@@ -490,7 +516,7 @@ public final class ParallelZipWriter {
                 return compressBytes(e, e.inline, store, def, nativeHandle);
             }
             if (e.size > spillThreshold) {
-                return compressLarge(e, store, level, spillDir);
+                return compressLarge(e, store, level, spillDir, nativeHandle);
             }
             return compressBytes(e, Files.readAllBytes(e.file), store, def, nativeHandle);
         } catch (IOException ex) {
@@ -500,32 +526,68 @@ public final class ParallelZipWriter {
 
     private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def,
                                             long nativeHandle) {
-        CRC32 crc = new CRC32();
-        crc.update(raw);
         if (store || raw.length == 0) {
+            CRC32 crc = new CRC32();
+            crc.update(raw);
             return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
         }
         if (nativeHandle != 0) {
-            Compressed viaNative = tryNativeDeflate(e, raw, nativeHandle, crc.getValue());
+            // crcOut is always filled in by the native call regardless of outcome (see
+            // pzip_libdeflate.c), so a real native failure below still has a valid CRC to
+            // hand the JDK fallback -- no separate Java CRC32 pass either way.
+            long[] crcOut = new long[1];
+            Compressed viaNative = tryNativeDeflate(e, raw, nativeHandle, crcOut);
             if (viaNative != null) return viaNative;
-            // fell through: native call failed for some reason, use the JDK path below
+            return compressWithJdk(e, raw, def, crcOut[0]);
         }
-        return compressWithJdk(e, raw, def, crc.getValue());
+        return compressWithJdk(e, raw, def); // no native at all: fuse CRC into the JDK deflate loop
     }
 
+    /**
+     * Fuses CRC-32 into the same chunked pass that feeds the JDK {@link Deflater}, mirroring
+     * {@link #deflateToFile}'s streaming loop, instead of a dedicated {@code crc.update(raw)}
+     * pass over the whole array beforehand. Used only when no native CRC is already available
+     * (native unavailable, or never attempted for this entry).
+     */
+    private static Compressed compressWithJdk(Entry e, byte[] raw, Deflater def) {
+        CRC32 crc = new CRC32();
+        def.reset();
+        GrowBuffer bos = new GrowBuffer(raw.length + (raw.length >> 10) + 64);
+        byte[] tmp = new byte[STREAM_BUF];
+        int off = 0;
+        while (off < raw.length) {
+            int chunk = Math.min(STREAM_BUF, raw.length - off);
+            crc.update(raw, off, chunk);
+            def.setInput(raw, off, chunk);
+            off += chunk;
+            while (!def.needsInput()) {
+                int n = def.deflate(tmp);
+                bos.write(tmp, 0, n);
+            }
+        }
+        def.finish();
+        while (!def.finished()) {
+            int n = def.deflate(tmp);
+            bos.write(tmp, 0, n);
+        }
+        return finishJdkCompress(e, raw, bos, crc.getValue());
+    }
+
+    /** As {@link #compressWithJdk(Entry, byte[], Deflater)}, but reusing an already-known CRC. */
     private static Compressed compressWithJdk(Entry e, byte[] raw, Deflater def, long crcValue) {
         def.reset();
         def.setInput(raw);
         def.finish();
-        // Pre-size to the raw length (deflate output is at most ~raw + a few bytes for
-        // incompressible data) so the buffer never doubles, and expose it directly instead
-        // of copying via toByteArray() -- Compressed writes only compSize bytes anyway.
         GrowBuffer bos = new GrowBuffer(raw.length + (raw.length >> 10) + 64);
         byte[] tmp = new byte[STREAM_BUF];
         while (!def.finished()) {
             int n = def.deflate(tmp);
             bos.write(tmp, 0, n);
         }
+        return finishJdkCompress(e, raw, bos, crcValue);
+    }
+
+    private static Compressed finishJdkCompress(Entry e, byte[] raw, GrowBuffer bos, long crcValue) {
         int compLen = bos.size();
         if (compLen >= raw.length) { // deflate didn't help: store this entry
             return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);
@@ -534,17 +596,21 @@ public final class ParallelZipWriter {
         return new Compressed(e, bos.raw(), null, false, crcValue, raw.length, compLen, 8);
     }
 
-    /** Returns null (caller falls back to the JDK Deflater) if the native call fails for any reason. */
-    private static Compressed tryNativeDeflate(Entry e, byte[] raw, long nativeHandle, long crcValue) {
+    /**
+     * Returns null (caller falls back to the JDK Deflater) if the native call fails for any
+     * reason. {@code crcOut[0]} is always set by the native call, win or lose, so the caller
+     * can reuse it for the JDK fallback instead of recomputing.
+     */
+    private static Compressed tryNativeDeflate(Entry e, byte[] raw, long nativeHandle, long[] crcOut) {
         int cap = raw.length + (raw.length >> 12) + 64;
         byte[] out = new byte[cap];
-        int n = LibdeflateNative.compress(nativeHandle, raw, 0, raw.length, out, 0, cap);
+        int n = LibdeflateNative.compress(nativeHandle, raw, 0, raw.length, out, 0, cap, crcOut);
         if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= raw.length)) {
             // sniff judged it already-compressed, or deflate didn't help: store this entry
-            return new Compressed(e, raw, null, false, crcValue, raw.length, raw.length, 0);
+            return new Compressed(e, raw, null, false, crcOut[0], raw.length, raw.length, 0);
         }
         if (n <= 0) return null; // real failure: caller uses the JDK Deflater
-        return new Compressed(e, out, null, false, crcValue, raw.length, n, 8);
+        return new Compressed(e, out, null, false, crcOut[0], raw.length, n, 8);
     }
 
     /** A ByteArrayOutputStream that exposes its backing array to avoid a trimming copy. */
@@ -553,23 +619,32 @@ public final class ParallelZipWriter {
         byte[] raw() { return buf; }
     }
 
-    // Incompressibility sniff for streamed (large) entries -- the Java-side mirror of the
-    // native in-memory sniff in pzip_libdeflate.c, for the >SPILL_THRESHOLD files (JREs,
-    // big archives) that stream through the JDK Deflater instead. Probe the head of the
-    // file; if it barely shrinks, skip deflating the whole already-compressed entry and
-    // STORE it (still reading the file once for its CRC). Conservative threshold so
-    // genuinely compressible entries are never mis-stored; content-based, so deterministic.
+    // Incompressibility sniff for large (>SPILL_THRESHOLD) entries (JREs, big archives) --
+    // the Java-side mirror of the native in-memory sniff in pzip_libdeflate.c, used before
+    // either large-entry compression path (mmap-native or streamed JDK Deflater) is
+    // attempted. Probe the head of the file; if it barely shrinks, skip deflating the whole
+    // already-compressed entry and STORE it (still reading the file once for its CRC).
+    // Conservative threshold so genuinely compressible entries are never mis-stored;
+    // content-based, so deterministic.
     static final int SNIFF_MIN_INPUT = 256 * 1024;
     static final int SNIFF_SAMPLE = 64 * 1024;
     static final int SNIFF_KEEP_PCT = 98; // store when the probe compresses to >= this % of its size
 
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
-    private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir) throws IOException {
-        CRC32 crc = new CRC32();
+    private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir,
+                                            long nativeHandle) throws IOException {
         if (store || looksIncompressible(e.file, e.size, level)) {
+            CRC32 crc = new CRC32();
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
+        if (nativeHandle != 0 && e.size <= MMAP_THRESHOLD) {
+            Compressed viaMmap = tryMmapNativeDeflate(e, nativeHandle);
+            if (viaMmap != null) return viaMmap;
+            // fell through: mmap or the native call failed for some reason, stream via the
+            // JDK Deflater below instead -- same fallback contract as tryNativeDeflate.
+        }
+        CRC32 crc = new CRC32();
         Path tmp = Files.createTempFile(spillDir, "e", ".z");
         long compSize = deflateToFile(e.file, tmp, level, crc);
         if (compSize >= e.size) { // deflate didn't help: stream the input as STORE
@@ -578,6 +653,36 @@ public final class ParallelZipWriter {
         }
         if (e.fileIsTemp) Files.deleteIfExists(e.file); // input temp fully consumed
         return new Compressed(e, null, tmp, true, crc.getValue(), e.size, compSize, 8);
+    }
+
+    /**
+     * Compresses a large-but-mmap-eligible entry by memory-mapping the source file and
+     * handing the native accelerator a direct view of it -- zero-copy on the read side,
+     * unlike every other path here, which reads through a JVM {@code byte[]}. Only the
+     * compressed output (and, for an already-compressed entry, nothing at all -- the STORE
+     * branch below streams the original file, same as the non-mmap sniffed-STORE case above)
+     * ever touches the JVM heap. Returns null (caller falls back to the streaming JDK
+     * Deflater path) if mapping the file fails or the native call itself fails.
+     */
+    private static Compressed tryMmapNativeDeflate(Entry e, long nativeHandle) {
+        int size = (int) e.size; // safe: caller already checked e.size <= MMAP_THRESHOLD
+        try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
+            if (ch.size() != e.size) return null; // file changed since it was enumerated
+            MappedByteBuffer mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            int cap = size + (size >> 12) + 64;
+            byte[] out = new byte[cap];
+            long[] crcOut = new long[1];
+            int n = LibdeflateNative.compressDirect(nativeHandle, mapped, size, out, 0, cap, crcOut);
+            if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= size)) {
+                // sniff judged it already-compressed, or deflate didn't help: stream the
+                // original file as STORE instead of materializing it into a byte[].
+                return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
+            }
+            if (n <= 0) return null; // real failure: caller uses the streaming JDK Deflater
+            return new Compressed(e, out, null, false, crcOut[0], e.size, n, 8);
+        } catch (IOException ex) {
+            return null; // mapping failed (e.g. platform limits): caller uses the streaming JDK Deflater
+        }
     }
 
     /**

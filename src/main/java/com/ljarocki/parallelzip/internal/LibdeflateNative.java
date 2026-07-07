@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
@@ -63,10 +64,13 @@ public final class LibdeflateNative {
      * compressed length; {@link #STORE_SENTINEL} ({@code -2}) if the sniff judged the input
      * already compressed and it should be STOREd; or {@code -1} if the native call failed
      * for any reason (e.g. the output buffer was too small), in which case callers should
-     * fall back to the JDK {@link java.util.zip.Deflater}.
+     * fall back to the JDK {@link java.util.zip.Deflater}. {@code crcOut[0]} always receives
+     * the CRC-32 of the input, computed natively while the array is already pinned for
+     * compression -- regardless of the return value -- so callers never need a separate
+     * {@link java.util.zip.CRC32} pass over the same bytes.
      */
     public static native int compress(long handle, byte[] in, int inOff, int inLen,
-                                       byte[] out, int outOff, int outCap);
+                                       byte[] out, int outOff, int outCap, long[] crcOut);
 
     /**
      * Compresses {@code count} independent buffers in one native call, reusing
@@ -74,10 +78,23 @@ public final class LibdeflateNative {
      * {@code outs[i]}; {@code outLens[i]} receives the compressed length, {@link #STORE_SENTINEL}
      * ({@code -2}) if the sniff says to STORE it, or {@code -1} if that one entry failed and
      * needs a JDK {@link java.util.zip.Deflater} fallback -- one entry's failure does not
-     * affect the others in the batch.
+     * affect the others in the batch. {@code crcs[i]} always receives the CRC-32 of
+     * {@code ins[i]}, computed natively alongside compression, regardless of {@code outLens[i]}.
      */
     public static native void compressBatch(long handle, byte[][] ins, byte[][] outs,
-                                             int[] outLens, int count);
+                                             int[] outLens, long[] crcs, int count);
+
+    /**
+     * Compresses directly from a direct (typically memory-mapped) {@code ByteBuffer} --
+     * {@code in[0, inLen)} -- into {@code out[outOff, outOff+outCap)}, without ever copying
+     * the input through a JVM heap {@code byte[]}. Used for the large-entry fast path, where
+     * {@code in} is a {@link java.nio.MappedByteBuffer} backed by the OS page cache instead
+     * of a {@code byte[]} read via {@link Files#readAllBytes}. Same return convention as
+     * {@link #compress}, including the fused {@code crcOut[0]}. {@code in} must be direct;
+     * a non-direct buffer causes a native failure ({@code -1}), not a crash.
+     */
+    public static native int compressDirect(long handle, ByteBuffer in, int inLen,
+                                             byte[] out, int outOff, int outCap, long[] crcOut);
 
     private static boolean load() {
         try {

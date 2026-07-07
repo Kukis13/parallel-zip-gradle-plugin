@@ -19,6 +19,7 @@ import java.util.zip.ZipFile;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Verifies the streaming (spill) path against the in-memory path. */
 class ParallelZipWriterStreamingTest {
@@ -127,6 +128,42 @@ class ParallelZipWriterStreamingTest {
             assertArrayEquals(incompressible, readAllEntries(out).get("blob.bin"));
             assertArrayEquals(compressible, readAllEntries(out).get("text.txt"));
         }
+    }
+
+    /**
+     * Exercises {@link ParallelZipWriter#tryMmapNativeDeflate}: entries above
+     * {@code spillThreshold} but comfortably below {@link ParallelZipWriter#MMAP_THRESHOLD}
+     * should still get native-accelerated DEFLATE, fed from a memory-mapped view of the
+     * source file rather than the JDK Deflater streaming path. Skipped (not failed) when no
+     * native build is bundled, same as the native-only tests in LibdeflateNativeTest.
+     */
+    @Test
+    void mmapLargeEntryRoundTripsWithNativeAccelerator() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        Path src = tmp.resolve("mmap-src");
+        Files.createDirectories(src);
+        byte[] compressible = "compress me via mmap ".repeat(80_000)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8); // ~1.8 MB, compressible
+        byte[] incompressible = pseudoRandom(2_000_000); // ~2 MB, incompressible
+        Files.write(src.resolve("text.txt"), compressible);
+        Files.write(src.resolve("blob.bin"), incompressible);
+
+        Path out = tmp.resolve("mmap.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        // A tiny spillThreshold pushes both entries past SPILL_THRESHOLD (file-backed,
+        // "large"), but both stay well under MMAP_THRESHOLD -- exactly the band
+        // tryMmapNativeDeflate targets.
+        ParallelZipWriter.write(sources, out, false, -1, 4, false, false, 1_000);
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            assertEquals(ZipEntry.DEFLATED, zf.getEntry("text.txt").getMethod(),
+                    "compressible large entry must still be DEFLATEd via mmap");
+            assertEquals(ZipEntry.STORED, zf.getEntry("blob.bin").getMethod(),
+                    "incompressible large entry must be STOREd (sniffed before the mmap attempt)");
+        }
+        Map<String, byte[]> entries = readAllEntries(out); // getInputStream validates CRC on read
+        assertArrayEquals(compressible, entries.get("text.txt"));
+        assertArrayEquals(incompressible, entries.get("blob.bin"));
     }
 
     @Test

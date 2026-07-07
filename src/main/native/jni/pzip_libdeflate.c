@@ -78,13 +78,28 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_f
     }
 }
 
+/*
+ * Sets crcOut[0] to a fully-computed jlong CRC-32. Done as a separate JNI call
+ * from the compress work above it so it never runs while a critical array is
+ * still pinned -- the JNI spec forbids calling back into other JNI functions
+ * inside a Get/ReleasePrimitiveArrayCritical section.
+ */
+static void pzip_set_crc_out(JNIEnv *env, jlongArray crcOut, uint32_t crc) {
+    jlong crc64 = (jlong) crc;
+    (*env)->SetLongArrayRegion(env, crcOut, 0, 1, &crc64);
+}
+
 /* Returns the compressed length, PZIP_STORE_SENTINEL (-2) when the sniff says
- * to STORE, or -1 on failure (caller falls back to the JDK Deflater). */
+ * to STORE, or -1 on failure (caller falls back to the JDK Deflater). crcOut[0]
+ * always receives the CRC-32 of the input -- computed here, adjacent to
+ * compression, while the array is already pinned -- so the Java side never
+ * needs its own separate full-buffer CRC32 pass. */
 JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compress(
         JNIEnv *env, jclass clazz,
         jlong handle,
         jbyteArray inArr, jint inOff, jint inLen,
-        jbyteArray outArr, jint outOff, jint outCap) {
+        jbyteArray outArr, jint outOff, jint outCap,
+        jlongArray crcOut) {
     (void) clazz;
     struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
     if (c == NULL) {
@@ -101,14 +116,16 @@ JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
         return -1;
     }
 
+    const void *inp = (const void *) (in + inOff);
+    uint32_t crc = libdeflate_crc32(0, inp, (size_t) inLen);
     jint rc = pzip_compress_or_store(
-            c,
-            (const void *) (in + inOff), (size_t) inLen,
+            c, inp, (size_t) inLen,
             (void *) (out + outOff), (size_t) outCap);
 
     (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
     (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
 
+    pzip_set_crc_out(env, crcOut, crc);
     return rc;
 }
 
@@ -123,23 +140,27 @@ JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
  * failed and needs a JDK Deflater fallback -- one failure never aborts the
  * rest of the batch. (Batched entries are small, so in practice the sniff
  * never fires here; the shared helper keeps the two paths consistent anyway.)
+ * crcs[i] always receives the CRC-32 of ins[i], computed here while that
+ * entry's array is pinned, regardless of outLens[i] -- including on a JDK
+ * Deflater fallback, so the Java side never redoes that scan.
  */
 JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compressBatch(
         JNIEnv *env, jclass clazz,
-        jlong handle, jobjectArray ins, jobjectArray outs, jintArray outLensArr, jint count) {
+        jlong handle, jobjectArray ins, jobjectArray outs, jintArray outLensArr,
+        jlongArray crcsArr, jint count) {
     (void) clazz;
     struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
 
-    jint *lens = (jint *) malloc(sizeof(jint) * (size_t) (count > 0 ? count : 1));
-    if (lens == NULL) {
-        return; /* leaves outLensArr as its Java-side default (0), treated as failure by the caller */
+    size_t n = (size_t) (count > 0 ? count : 1);
+    jint *lens = (jint *) malloc(sizeof(jint) * n);
+    jlong *crcs = (jlong *) malloc(sizeof(jlong) * n);
+    if (lens == NULL || crcs == NULL) {
+        free(lens);
+        free(crcs);
+        return; /* leaves outLensArr/crcsArr at their Java-side defaults (0), treated as failure by the caller */
     }
 
     for (jint i = 0; i < count; i++) {
-        if (c == NULL) {
-            lens[i] = -1;
-            continue;
-        }
         jbyteArray inArr = (jbyteArray) (*env)->GetObjectArrayElement(env, ins, i);
         jbyteArray outArr = (jbyteArray) (*env)->GetObjectArrayElement(env, outs, i);
         jsize inLen = (*env)->GetArrayLength(env, inArr);
@@ -153,8 +174,10 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
                 (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
             }
             lens[i] = -1;
+            crcs[i] = 0;
         } else {
-            lens[i] = pzip_compress_or_store(
+            crcs[i] = (jlong) libdeflate_crc32(0, (const void *) in, (size_t) inLen);
+            lens[i] = (c == NULL) ? -1 : pzip_compress_or_store(
                     c, (const void *) in, (size_t) inLen, (void *) out, (size_t) outCap);
             (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
             (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
@@ -165,5 +188,47 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
     }
 
     (*env)->SetIntArrayRegion(env, outLensArr, 0, count, lens);
+    (*env)->SetLongArrayRegion(env, crcsArr, 0, count, crcs);
     free(lens);
+    free(crcs);
+}
+
+/*
+ * Compresses directly from a direct (typically memory-mapped) ByteBuffer,
+ * without ever copying the input through a JVM byte[] first -- the
+ * large-entry counterpart to compress() above, which needs a byte[] because
+ * that's what Files.readAllBytes produces. GetDirectBufferAddress needs no
+ * pin/unpin: direct buffers live outside the movable Java heap already.
+ * Same return convention (including the fused crcOut[0]) as compress().
+ */
+JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compressDirect(
+        JNIEnv *env, jclass clazz,
+        jlong handle,
+        jobject inBuf, jint inLen,
+        jbyteArray outArr, jint outOff, jint outCap,
+        jlongArray crcOut) {
+    (void) clazz;
+    struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
+    if (c == NULL) {
+        return -1;
+    }
+
+    void *inp = (*env)->GetDirectBufferAddress(env, inBuf);
+    if (inp == NULL) {
+        return -1;
+    }
+    jbyte *out = (*env)->GetPrimitiveArrayCritical(env, outArr, NULL);
+    if (out == NULL) {
+        return -1;
+    }
+
+    uint32_t crc = libdeflate_crc32(0, inp, (size_t) inLen);
+    jint rc = pzip_compress_or_store(
+            c, inp, (size_t) inLen,
+            (void *) (out + outOff), (size_t) outCap);
+
+    (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
+
+    pzip_set_crc_out(env, crcOut, crc);
+    return rc;
 }
