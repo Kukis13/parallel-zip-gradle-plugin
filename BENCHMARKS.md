@@ -6,29 +6,49 @@ The most direct evidence for this plugin isn't archiving a static directory tree
 what happens when you actually swap `type: Zip` for `type: ParallelZip` in a real
 project's real build. For each project below: clone it, build once with its stock `Zip`
 task, add a second task with identical configuration but `ParallelZip`, then build again
-and diff the two tasks' own execution time (via Gradle's `--profile` report, or
-`doFirst`/`doLast` timing hooks when `--profile` wasn't available — see notes).
-Everything else in the build (compilation, resource processing, dependency resolution)
-was warm/cached in both runs, so only the archiving step itself is being compared. Same
-machine: 12 logical cores, JDK 17/21/25 (whichever each project's build required).
+and diff the two tasks' own execution time (via `doFirst`/`doLast`
+`System.nanoTime()` hooks, or Gradle's `--profile` report where hooks weren't added —
+see notes). Everything else in the build (compilation, resource processing, dependency
+resolution) was warm/cached in every run, so only the archiving step itself is being
+compared. Same machine: 12 logical cores, JDK 17/21/25 (whichever each project's build
+required), each project measured in isolation (no other Gradle daemons running).
 
 | Project | Task | Stock `Zip` | `ParallelZip` | Speedup |
 |---|---|--:|--:|--:|
-| Micronaut Starter (Launch) CLI | `distZip` | 0.911 s | 0.117 s | **7.79×** |
-| JBake | `jbake-dist:distZip` | 2.363 s | 0.330 s | **7.16×** |
-| Groovy 4.0.24 | `groovy-binary:distBin` | 1.140 s | 0.218 s | **5.23×** |
-| Gradle Profiler | `distZip` | 0.839 s | 0.169 s | **4.96×** |
-| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.636 s | 1.032 s | **4.49×** |
-| SonarQube 26.6 | `sonar-application:zip` | 29.557 s | 11.134 s | **2.66×** |
-| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.348 s | 0.141 s | **2.47×** |
-| Grails CLI | `grails-cli:distZip` | 1.286 s | 0.621 s | **2.07×** |
-| JBang | `distZip` | 0.411 s | 0.200 s | **2.06×** |
+| Micronaut Starter (Launch) CLI | `distZip` | 0.757 s | 0.070 s | **10.89×** |
+| JBake | `jbake-dist:distZip` | 2.915 s | 0.290 s | **10.05×** |
+| Gradle Profiler | `distZip` | 0.815 s | 0.169 s | **4.82×** |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 3.690 s | 0.815 s | **4.53×** |
+| Groovy 4.0.24 | `groovy-binary:distBin` | 0.979 s | 0.241 s | **4.06×** |
+| JBang | `distZip` | 0.404 s | 0.126 s | **3.21×** |
+| SonarQube 26.6 | `sonar-application:zip` | 24.991 s | 8.520 s | **2.93×** |
+| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.273 s | 0.096 s | **2.84×** |
+| Grails CLI | `grails-cli:distZip` | 1.372 s | 0.662 s | **2.07×** |
 
-Average speedup across these nine real production Zip tasks: **4.32×**. Archive sizes
-matched within ~1% between the stock and parallel runs in every case (see
-`benchmarks/results/gradle-inbuild.tsv` for the raw byte counts) — the small deltas are
+Geometric-mean speedup across these nine real production Zip tasks: **~4.3×**. Archive
+sizes matched within ~1–5% between the stock and parallel runs in every case (see
+`benchmarks/results/gradle-inbuild.tsv` for the raw byte counts) — the deltas are
 expected DEFLATE-codec variance (native libdeflate vs. the JDK `Deflater`), not missing
 content.
+
+Measurement confidence varies by row — most `ParallelZip` readings above are the median
+of 2–3 isolated runs (Spring Boot CLI, JBang, Grails, Gradle-tool all confirmed via
+repeats; the last showed real run-to-run variance of up to 2× even with the *same* jar,
+apparently from Gradle's own task-graph overhead on such a large multi-project build,
+not the archiving step). JBake, Groovy, Micronaut, and every `Zip` (stock) row are single
+readings — treated as reliable where the gap is large (an order of magnitude, like
+JBake/Micronaut, isn't noise) but worth another pass before quoting to two decimal
+places. Two more things worth knowing before reading too much into any single row:
+
+- **Micronaut and JBake show the *smallest* additional speedup from v1.1.0 to the
+  current native/mmap/CRC-fusion work** (10.89× and 10.05× vs. stock, but only ~1.0–1.6×
+  faster than v1.1.0 specifically) — most of their win was already banked by v1.1.0's
+  batching and incompressibility sniff. Their distributions bundle many small,
+  already-compressed jars, exactly the shape those two v1.1.0 features target.
+- **`--profile`'s per-task number includes Gradle's own bookkeeping** (up-to-date
+  checks, snapshotting), not just the task's own execution — for fast tasks this can be
+  a large fraction of the reported time. Prefer `doFirst`/`doLast` hooks for anything
+  under ~1s.
 
 Three projects from the original candidate list were dropped rather than forced in:
 

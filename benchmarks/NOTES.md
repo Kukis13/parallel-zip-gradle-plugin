@@ -48,6 +48,23 @@ Lessons learned doing this by hand for 9 projects, worth encoding if this gets a
 - **Some builds are simply too heavy to be worth it** (Kotlin/Native's compiler build).
   Time-box the investigation; if a project needs many minutes just to reach the target
   task, it's a bad fit for a benchmark suite meant to be re-run regularly.
+- **Single-shot task timing is not trustworthy — always take 3+ readings and use the
+  median.** Confirmed this the hard way comparing v1.1.0 against a later branch: fast
+  tasks (Micronaut Starter CLI, ~100ms) swung by ±40% between consecutive runs of the
+  *same* jar, enough to flip which version looked faster. Large multi-project builds are
+  just as bad for a different reason — gradle/gradle's own `binDistributionZip` varied
+  from 806ms to 1896ms across three isolated runs of the same jar (>2x), apparently from
+  variance elsewhere in its huge task graph rather than the archiving step itself. A
+  single reading can show either version "winning" by a wide margin; only the median of
+  several is meaningful. Concurrent Gradle daemons from other benchmark runs make this
+  much worse (one run read 11.1s that a clean rerun later showed was really ~8.5s) — run
+  one project at a time, `--stop` daemons between projects if unsure.
+- **`--profile`'s per-task number includes Gradle's own bookkeeping** (up-to-date
+  checks, snapshotting, etc.), not just the task's own `Action` execution — for a fast
+  task this fixed overhead can be a big fraction of the reported time (seen: `--profile`
+  reported 127ms for a task whose `doFirst`/`doLast` hooks measured 67ms of actual work).
+  Prefer the hooks for anything under ~1s; for slower tasks the discrepancy is
+  proportionally small enough not to matter.
 
 If/when this becomes a real one-command framework, the automatable parts are: cloning at
 a pinned tag, building the two plugin jars, running `./gradlew projects` to resolve the

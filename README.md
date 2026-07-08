@@ -109,14 +109,14 @@ directory tree, four codecs) benchmarks in **[BENCHMARKS.md](BENCHMARKS.md)**:
 
 | Project | Task | Stock `Zip` | `ParallelZip` | Speedup |
 |---|---|--:|--:|--:|
-| Micronaut Starter (Launch) CLI | `distZip` | 0.911 s | 0.117 s | **7.79×** |
-| JBake | `jbake-dist:distZip` | 2.363 s | 0.330 s | **7.16×** |
-| Groovy 4.0.24 | `groovy-binary:distBin` | 1.140 s | 0.218 s | **5.23×** |
-| SonarQube 26.6 | `sonar-application:zip` | 29.557 s | 11.134 s | **2.66×** |
-| JBang | `distZip` | 0.411 s | 0.200 s | **2.06×** |
+| Micronaut Starter (Launch) CLI | `distZip` | 0.757 s | 0.070 s | **10.89×** |
+| JBake | `jbake-dist:distZip` | 2.915 s | 0.290 s | **10.05×** |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 3.690 s | 0.815 s | **4.53×** |
+| SonarQube 26.6 | `sonar-application:zip` | 24.991 s | 8.520 s | **2.93×** |
+| JBang | `distZip` | 0.404 s | 0.126 s | **3.21×** |
 
-Average speedup across nine real production Zip tasks measured this way: **4.32×**.
-Archive sizes matched within ~1% of the stock task in every case — DEFLATE trades a
+Geometric-mean speedup across nine real production Zip tasks measured this way: **~4.3×**.
+Archive sizes matched within ~1–5% of the stock task in every case — DEFLATE trades a
 small amount of archive size for a large speed win, so it's still the safe default. Use
 `store = true` only for archives you already know are jar/binary-heavy, where the size
 cost is small and the speedup large.

@@ -1,12 +1,12 @@
-project	task	baselineMs	parallelMs	baselineBytes	parallelBytes	notes
-SonarQube	:sonar-application:zip	29557	11134	926556100	934826730	real 927MB product distro
-Groovy	:groovy-binary:distBin	1140	218	29997515	30004046	real 30MB product distro
-Spring Boot CLI	:cli:spring-boot-cli:zip	348	141	7347896	?	overwrote same filename (configureArchive resets classifier), size not captured separately
-Gradle (the tool)	:distributions-full:binDistributionZip	4636	1032	?	?	measured via doFirst/doLast (config cache + isolated projects block --profile)
-JBang	:distZip	411	200	13176985	13138157	real 13MB product distro
-JBake	:jbake-dist:distZip	2363	330	90670297	90890577	real 90MB product distro (incl. cloned example project zips)
-Micronaut Starter CLI	:micronaut-cli:distZip	911	117	32676360	34311579	real 33MB product distro
-Gradle Profiler	:distZip	839	169	35241668	35161501	real 35MB product distro
-Corda	buildCordappDependenciesZip	SKIPPED	SKIPPED	-	-	task is broken on current HEAD (resolves non-resolvable testImplementation config), pre-existing bug unrelated to parallel-zip
-Grails CLI	:grails-cli:distZip	1286	621	55505741	55372409	real 55MB product distro
-Kotlin/Native	distNativeSources / samplesZip	SKIPPED	SKIPPED	-	-	Kotlin/Native compiler build too heavy to finish in reasonable time
+project	task	stockZipMs	v1.1.0ParallelZipMs	currentParallelZipMs	confidence	notes
+SonarQube	:sonar-application:zip	24991	9114	8520	high	all isolated single readings; real 927MB product distro
+Groovy	:groovy-binary:distBin	979.4	241	241	medium	stock: 1 reading; v1.1.0/current: confirmed flat via 3x repeats each; real 30MB product distro
+Spring Boot CLI	:cli:spring-boot-cli:zip	272.6	232	96	high	stock: 1 reading; v1.1.0/current: confirmed via 3x repeats each
+Gradle (the tool)	:distributions-full:binDistributionZip	3690	1670	815	medium	stock: 1 reading; v1.1.0/current: medians of 3 readings each, real variance up to 2x from task-graph overhead, not the archiving step
+JBang	:distZip	404.1	328	126	high	stock: 1 reading; v1.1.0/current: confirmed via 3x repeats each
+JBake	:jbake-dist:distZip	2914.7	516	290	medium	single clean isolated reading each; real 90MB product distro (incl. cloned example project zips)
+Micronaut Starter CLI	:micronaut-cli:distZip	756.6	63	69.5	medium	stock: 2 tight readings; v1.1.0/current: noise-dominated at this scale, no real difference between plugin versions; real 33MB product distro
+Gradle Profiler	:distZip	815	422	169	low	stock: 1 reading; v1.1.0/current: single readings each, not re-verified with repeats
+Grails CLI	:grails-cli:distZip	1372.0	1337	662.3	high	stock: 1 reading; v1.1.0/current: medians of 2 readings each, confirmed; real 55MB product distro
+Corda	buildCordappDependenciesZip	SKIPPED	SKIPPED	SKIPPED	n/a	task is broken on current HEAD (resolves non-resolvable testImplementation config), pre-existing bug unrelated to parallel-zip
+Kotlin/Native	distNativeSources / samplesZip	SKIPPED	SKIPPED	SKIPPED	n/a	Kotlin/Native compiler build too heavy to finish in reasonable time
