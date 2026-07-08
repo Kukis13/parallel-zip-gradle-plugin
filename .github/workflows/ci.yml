@@ -39,8 +39,10 @@ jobs:
             classifier: macos-arm64
             libfile: libpzip_libdeflate.dylib
             javaDistribution: temurin
-          # macos-latest is arm64-only; macos-13 is GitHub's last Intel runner image.
-          - runner: macos-13
+          # macos-latest is arm64-only; macos-13 (GitHub's original Intel image for this
+          # matrix) was fully retired in December 2025. macos-15-intel is the current
+          # Intel-hosted runner label.
+          - runner: macos-15-intel
             classifier: macos-x64
             libfile: libpzip_libdeflate.dylib
             javaDistribution: temurin
