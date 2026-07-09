@@ -40,11 +40,11 @@ readings — treated as reliable where the gap is large (an order of magnitude, 
 JBake/Micronaut, isn't noise) but worth another pass before quoting to two decimal
 places. Two more things worth knowing before reading too much into any single row:
 
-- **Micronaut and JBake show the *smallest* additional speedup from v1.1.0 to the
-  current native/mmap/CRC-fusion work** (10.89× and 10.05× vs. stock, but only ~1.0–1.6×
-  faster than v1.1.0 specifically) — most of their win was already banked by v1.1.0's
-  batching and incompressibility sniff. Their distributions bundle many small,
-  already-compressed jars, exactly the shape those two v1.1.0 features target.
+- **Micronaut and JBake show the *smallest* additional speedup from the native/mmap/CRC-fusion
+  work** (10.89× and 10.05× vs. stock, but only ~1.0–1.6× faster than the earlier codec
+  path) — most of their win was already banked by the earlier batching and
+  incompressibility sniff. Their distributions bundle many small, already-compressed jars,
+  exactly the shape those two features target.
 - **`--profile`'s per-task number includes Gradle's own bookkeeping** (up-to-date
   checks, snapshotting), not just the task's own execution — for fast tasks this can be
   a large fraction of the reported time. Prefer `doFirst`/`doLast` hooks for anything
