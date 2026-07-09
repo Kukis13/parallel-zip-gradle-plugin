@@ -37,7 +37,7 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'com.ljarocki.parallel-zip' version '1.1.0'
+    id 'com.ljarocki.parallel-zip' version '1.3.0'
 }
 
 tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {
