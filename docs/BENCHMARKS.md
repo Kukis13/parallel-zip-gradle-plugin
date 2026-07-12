@@ -105,7 +105,7 @@ compile/download chain. Same machine: 12 logical cores, JDK 21, warm cache.
 in this table ran with `-Xmx4g` for consistency). It's also the corpus where both
 DEFLATE codecs gain the least: a handful of individual files (500+ MiB) dominate its
 wall time and always stream through the JDK codec regardless of which fast-path codec
-handles the smaller entries (see [Options](README.md#options)).
+handles the smaller entries (see [How it works](ARCHITECTURE.md)).
 
 ² A rolling snapshot build, not a fixed release — file count and size will drift between
 re-benchmarks as it moves forward, unlike the other ten rows.
@@ -117,3 +117,6 @@ clear win on both codecs, size cost included. STORE trades size for speed more
 aggressively, and how much size depends entirely on how compressible the content already
 is: use `store = true` only for archives you already know are jar/binary-heavy, where the
 size cost is small and the speedup large.
+
+See also: [How it works](ARCHITECTURE.md) · [Compatibility](COMPATIBILITY.md) ·
+[Reproducibility](REPRODUCIBILITY.md) · [Development](DEVELOPMENT.md)
