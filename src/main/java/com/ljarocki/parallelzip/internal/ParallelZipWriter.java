@@ -6,6 +6,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
@@ -526,7 +528,7 @@ public final class ParallelZipWriter {
 
     private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def,
                                             long nativeHandle) {
-        if (store || raw.length == 0) {
+        if (store || raw.length == 0 || looksAlreadyCompressed(raw, raw.length)) {
             CRC32 crc = new CRC32();
             crc.update(raw);
             return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
@@ -633,7 +635,7 @@ public final class ParallelZipWriter {
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
     private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir,
                                             long nativeHandle) throws IOException {
-        if (store || looksIncompressible(e.file, e.size, level)) {
+        if (store || looksAlreadyCompressed(e.file) || looksIncompressible(e.file, e.size, level)) {
             CRC32 crc = new CRC32();
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
@@ -666,9 +668,10 @@ public final class ParallelZipWriter {
      */
     private static Compressed tryMmapNativeDeflate(Entry e, long nativeHandle) {
         int size = (int) e.size; // safe: caller already checked e.size <= MMAP_THRESHOLD
+        MappedByteBuffer mapped = null;
         try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
             if (ch.size() != e.size) return null; // file changed since it was enumerated
-            MappedByteBuffer mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
             int cap = size + (size >> 12) + 64;
             byte[] out = new byte[cap];
             long[] crcOut = new long[1];
@@ -682,7 +685,102 @@ public final class ParallelZipWriter {
             return new Compressed(e, out, null, false, crcOut[0], e.size, n, 8);
         } catch (IOException ex) {
             return null; // mapping failed (e.g. platform limits): caller uses the streaming JDK Deflater
+        } finally {
+            // The native call above is synchronous and fully done reading `mapped` by the time
+            // it returns, on every path (success, sniffed-STORE, or failure) -- none of them
+            // keep a reference to the mapping itself. Release it explicitly now rather than
+            // waiting on GC: on Windows, an unreleased mapping keeps its backing file locked
+            // against deletion or rewrite -- by anyone, including a later task in the same
+            // long-lived Gradle daemon -- until the buffer is finalized, which is not bounded.
+            unmap(mapped);
         }
+    }
+
+    /**
+     * Best-effort explicit release of a direct buffer's OS-level mapping via
+     * {@code sun.misc.Unsafe#invokeCleaner}, in place of waiting for ordinary GC finalization.
+     * A no-op (mapping falls back to GC-driven cleanup, same as before this method existed) if
+     * {@code buffer} is null or {@code Unsafe} internals aren't accessible on the running JVM.
+     */
+    private static void unmap(MappedByteBuffer buffer) {
+        if (buffer == null) return;
+        try {
+            Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+            Field theUnsafe = unsafeClass.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            Object unsafe = theUnsafe.get(null);
+            Method invokeCleaner = unsafeClass.getMethod("invokeCleaner", ByteBuffer.class);
+            invokeCleaner.invoke(unsafe, buffer);
+        } catch (Throwable ignored) {
+            // Fall back silently: the mapping is still released eventually, just on GC's
+            // schedule instead of immediately.
+        }
+    }
+
+    /**
+     * Header signatures (at offset 0 unless noted) for formats that are already compressed, or
+     * already store final encoded pixel/audio/stream data, so re-running DEFLATE over them costs
+     * real CPU for negligible gain. Checked before {@link #looksIncompressible}: that probe only
+     * samples the first {@link #SNIFF_SAMPLE} bytes, which can be unrepresentative for a
+     * container format whose leading entry is small or stored (e.g. a jar's
+     * {@code META-INF/MANIFEST.MF}), so a signature match here skips both the probe and the
+     * compression attempt outright rather than risk paying full compression cost anyway.
+     */
+    private static final byte[][] COMPRESSED_MAGICS = {
+        {0x50, 0x4B, 0x03, 0x04},                                     // ZIP family: jar/war/ear/apk/aar/
+        {0x50, 0x4B, 0x05, 0x06},                                     // whl/nupkg/docx/xlsx/pptx/odt/zip
+        {0x50, 0x4B, 0x07, 0x08},                                     // (empty / spanned ZIP variants)
+        {0x1F, (byte) 0x8B},                                          // gzip (.gz, .tgz, .tar.gz)
+        {0x42, 0x5A, 0x68},                                           // bzip2
+        {(byte) 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00},                  // xz
+        {0x37, 0x7A, (byte) 0xBC, (byte) 0xAF, 0x27, 0x1C},           // 7-zip
+        {(byte) 0x28, (byte) 0xB5, 0x2F, (byte) 0xFD},                // zstd
+        {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00},                   // rar 1.5-4.x
+        {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00},             // rar 5.0
+        {0x04, 0x22, 0x4D, 0x18},                                     // lz4 frame
+        {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},      // png
+        {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF},                      // jpeg
+        {0x47, 0x49, 0x46, 0x38},                                     // gif87a / gif89a
+        {0x1A, 0x45, (byte) 0xDF, (byte) 0xA3},                       // webm/mkv (EBML)
+        {0x4F, 0x67, 0x67, 0x53},                                     // ogg
+        {0x77, 0x4F, 0x46, 0x46},                                     // woff
+        {0x77, 0x4F, 0x46, 0x32},                                     // woff2
+    };
+
+    /**
+     * Cheap, exact alternative to the statistical {@link #looksIncompressible} sniff: matches
+     * {@code header} against {@link #COMPRESSED_MAGICS}, plus two signatures that aren't at
+     * offset 0 (WebP's {@code WEBP} at byte 8, inside a RIFF container; ISO-BMFF's {@code ftyp}
+     * at byte 4, covering mp4/mov/m4a). {@code len} is the number of valid bytes actually read
+     * into {@code header} (may be shorter than {@code header.length} for a small entry).
+     */
+    private static boolean looksAlreadyCompressed(byte[] header, int len) {
+        outer:
+        for (byte[] magic : COMPRESSED_MAGICS) {
+            if (len < magic.length) continue;
+            for (int i = 0; i < magic.length; i++) {
+                if (header[i] != magic[i]) continue outer;
+            }
+            return true;
+        }
+        if (len >= 12 && header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
+                && header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P') {
+            return true; // RIFF....WEBP
+        }
+        if (len >= 8 && header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') {
+            return true; // ISO-BMFF ftyp box: mp4/mov/m4a
+        }
+        return false;
+    }
+
+    /** As {@link #looksAlreadyCompressed(byte[], int)}, reading just the header of a file-backed entry. */
+    private static boolean looksAlreadyCompressed(Path file) throws IOException {
+        byte[] header = new byte[16];
+        int got;
+        try (InputStream in = Files.newInputStream(file)) {
+            got = in.readNBytes(header, 0, header.length);
+        }
+        return looksAlreadyCompressed(header, got);
     }
 
     /**
