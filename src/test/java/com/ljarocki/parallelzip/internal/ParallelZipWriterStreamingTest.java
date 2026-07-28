@@ -17,6 +17,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -164,6 +165,38 @@ class ParallelZipWriterStreamingTest {
         Map<String, byte[]> entries = readAllEntries(out); // getInputStream validates CRC on read
         assertArrayEquals(compressible, entries.get("text.txt"));
         assertArrayEquals(incompressible, entries.get("blob.bin"));
+    }
+
+    /**
+     * Regression test for a Windows-only failure mode: an unreleased {@code MappedByteBuffer}
+     * from {@link ParallelZipWriter#tryMmapNativeDeflate} keeps its backing file locked against
+     * deletion or rewrite (by anyone, including a later Gradle task in the same daemon) until
+     * the buffer is garbage-collected -- unbounded, and in practice easy to still be holding the
+     * lock by the time the very next task in the build tries to touch that same file. This isn't
+     * reproducible on POSIX (mmap doesn't block unlink/rewrite there), so it's gated to Windows;
+     * it's also not guaranteed to fail pre-fix (GC could opportunistically collect the buffer in
+     * time), but post-fix it must deterministically pass every time, since the mapping is now
+     * released synchronously right after the native call returns.
+     */
+    @Test
+    void mmapEntrySourceFileIsNotLockedAfterCompression() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        assumeTrue(System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win"),
+                "mmap-held file locks blocking delete/rewrite are Windows-specific");
+        Path src = tmp.resolve("mmap-lock-src");
+        Files.createDirectories(src);
+        byte[] compressible = "compress me via mmap ".repeat(80_000)
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8); // ~1.8 MB, compressible
+        Path input = src.resolve("input.bin");
+        Files.write(input, compressible);
+
+        Path out = tmp.resolve("mmap-lock.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, -1, 4, false, false, 1_000); // forces the mmap path
+
+        assertDoesNotThrow(() -> Files.write(input, "replacement".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                "source file must be immediately rewritable after being mmap-compressed, "
+                        + "not blocked by a lingering MappedByteBuffer");
     }
 
     @Test
