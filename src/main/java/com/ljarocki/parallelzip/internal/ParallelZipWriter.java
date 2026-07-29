@@ -28,8 +28,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
+
+import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.Logging;
 
 /**
  * Core parallel ZIP writer. Stateless and reusable; both the directory front-end
@@ -52,6 +56,16 @@ public final class ParallelZipWriter {
 
     private ParallelZipWriter() {}
 
+    private static final Logger LOG = Logging.getLogger(ParallelZipWriter.class);
+    /**
+     * Below this daemon max heap, warn once per daemon that large-entry archives (bundled
+     * JREs, big jars) risk {@code OutOfMemoryError} even though {@link Sink#budgetMiB} bounds
+     * total buffered bytes -- a small heap can still exhaust itself on GC fragmentation from a
+     * handful of large individual buffers well before that nominal budget is reached.
+     */
+    private static final long WARN_HEAP_FLOOR_MIB = 2048;
+    private static final AtomicBoolean lowHeapWarned = new AtomicBoolean(false);
+
     static final int LFH_SIG = 0x04034b50;
     static final int CDH_SIG = 0x02014b50;
     static final int EOCD_SIG = 0x06054b50;
@@ -67,10 +81,12 @@ public final class ParallelZipWriter {
      * Spilled entries up to this size are still compressed via the native libdeflate
      * accelerator, fed directly from a memory-mapped view of the source file instead of a
      * {@code Files.readAllBytes} heap copy (see {@link #tryMmapNativeDeflate}). Bounded well
-     * under the ~2 GiB {@link FileChannel#map} limit, and under this an entry's compressed
-     * output buffer is comfortably a fraction of the {@code Sink} in-memory byte budget.
-     * Entries beyond this always use the plain streaming JDK {@link Deflater} path, which has
-     * no size limit.
+     * under the ~2 GiB {@link FileChannel#map} limit. This is only the absolute ceiling --
+     * each {@code Sink} scales the actual eligibility cutoff down further
+     * ({@code effectiveMmapThreshold}) on small heaps, so a single entry's compressed-output
+     * buffer never eats more than half the byte budget and never becomes a heap-fragmenting
+     * "humongous" allocation. Entries beyond the effective cutoff always use the plain
+     * streaming JDK {@link Deflater} path, which has no size limit.
      */
     static final long MMAP_THRESHOLD = 128L << 20; // 128 MiB
     static final int STREAM_BUF = 1 << 16;
@@ -205,6 +221,11 @@ public final class ParallelZipWriter {
         private final Semaphore countFlight;   // bounds the NUMBER of in-flight entries
         private final Semaphore byteFlight;     // bounds in-memory BYTES held (in MiB units)
         private final int budgetMiB;
+        // Never more than half the byte budget in a single mmap-path output buffer, so at
+        // least two such entries can be in flight without one alone dominating -- and, on a
+        // small heap, so this buffer doesn't become a multi-hundred-MiB "humongous object"
+        // that fragments a G1 old generation sized for a much smaller nominal footprint.
+        private final long effectiveMmapThreshold;
         private final BlockingQueue<Item> queue;
         private final Thread writerThread;
         private final boolean store;
@@ -251,8 +272,18 @@ public final class ParallelZipWriter {
             });
             this.countFlight = new Semaphore(threads * 4);
             // Cap in-memory bytes to a fraction of the heap so entries can't OOM the daemon.
-            this.budgetMiB = (int) Math.max(16, Math.min(1024, Runtime.getRuntime().maxMemory() / 6 / MIB));
+            long maxMemory = Runtime.getRuntime().maxMemory();
+            this.budgetMiB = (int) Math.max(16, Math.min(1024, maxMemory / 6 / MIB));
+            this.effectiveMmapThreshold = Math.min(MMAP_THRESHOLD, Math.max(1, budgetMiB / 2) * MIB);
             this.byteFlight = new Semaphore(budgetMiB);
+            long maxMemoryMiB = maxMemory / MIB;
+            if (maxMemoryMiB < WARN_HEAP_FLOOR_MIB && lowHeapWarned.compareAndSet(false, true)) {
+                LOG.warn("parallel-zip: Gradle daemon max heap is only ~{} MiB. Archives with "
+                        + "large entries (bundled JREs, big jars) can hit OutOfMemoryError below "
+                        + "~{} MiB; if that happens, raise the daemon heap, e.g. "
+                        + "org.gradle.jvmargs=-Xmx2g in gradle.properties.",
+                        maxMemoryMiB, WARN_HEAP_FLOOR_MIB);
+            }
             this.queue = new ArrayBlockingQueue<>(threads * 4 + 1);
             this.startNanos = System.nanoTime();
             this.writerThread = new Thread(() -> runWriter(out, forceZip64), "parallel-zip-writer");
@@ -293,7 +324,7 @@ public final class ParallelZipWriter {
             countFlight.acquire();
             Future<List<Compressed>> f =
                     pool.submit(() -> compressBatch(batch, store, level, deflaters.get(), nativeHandles.get(),
-                            spillThreshold, spillDir));
+                            spillThreshold, spillDir, effectiveMmapThreshold));
             queue.put(new Item(f, permits));
         }
 
@@ -326,7 +357,7 @@ public final class ParallelZipWriter {
                 if (!store) mem *= 2; // raw + compressed buffer resident together
                 return (int) Math.max(1, Math.min(budgetMiB, (mem + MIB - 1) / MIB));
             }
-            if (e.file != null && useNative && e.size <= MMAP_THRESHOLD) {
+            if (e.file != null && useNative && e.size <= effectiveMmapThreshold) {
                 // The mmap fast path (tryMmapNativeDeflate) never materializes the input as a
                 // byte[] -- it's a page-cache-backed mapping, not heap memory -- so only the
                 // one compressed-output buffer counts against the budget, not 2x.
@@ -444,13 +475,14 @@ public final class ParallelZipWriter {
      * path, which still uses the same reused native handle for a single-buffer call.
      */
     private static List<Compressed> compressBatch(List<Entry> batch, boolean store, int level, Deflater def,
-                                                  long nativeHandle, long spillThreshold, Path spillDir) {
+                                                  long nativeHandle, long spillThreshold, Path spillDir,
+                                                  long mmapThreshold) {
         if (!store && nativeHandle != 0 && batch.size() > 1) {
             return compressBatchNative(batch, def, nativeHandle);
         }
         List<Compressed> out = new ArrayList<>(batch.size());
         for (Entry e : batch) {
-            out.add(compress(e, store, level, def, nativeHandle, spillThreshold, spillDir));
+            out.add(compress(e, store, level, def, nativeHandle, spillThreshold, spillDir, mmapThreshold));
         }
         return out;
     }
@@ -511,14 +543,15 @@ public final class ParallelZipWriter {
     }
 
     private static Compressed compress(Entry e, boolean store, int level, Deflater def,
-                                       long nativeHandle, long spillThreshold, Path spillDir) {
+                                       long nativeHandle, long spillThreshold, Path spillDir,
+                                       long mmapThreshold) {
         try {
             if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
             if (e.inline != null) {
                 return compressBytes(e, e.inline, store, def, nativeHandle);
             }
             if (e.size > spillThreshold) {
-                return compressLarge(e, store, level, spillDir, nativeHandle);
+                return compressLarge(e, store, level, spillDir, nativeHandle, mmapThreshold);
             }
             return compressBytes(e, Files.readAllBytes(e.file), store, def, nativeHandle);
         } catch (IOException ex) {
@@ -634,13 +667,13 @@ public final class ParallelZipWriter {
 
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
     private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir,
-                                            long nativeHandle) throws IOException {
+                                            long nativeHandle, long mmapThreshold) throws IOException {
         if (store || looksAlreadyCompressed(e.file) || looksIncompressible(e.file, e.size, level)) {
             CRC32 crc = new CRC32();
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
-        if (nativeHandle != 0 && e.size <= MMAP_THRESHOLD) {
+        if (nativeHandle != 0 && e.size <= mmapThreshold) {
             Compressed viaMmap = tryMmapNativeDeflate(e, nativeHandle);
             if (viaMmap != null) return viaMmap;
             // fell through: mmap or the native call failed for some reason, stream via the
@@ -667,7 +700,7 @@ public final class ParallelZipWriter {
      * Deflater path) if mapping the file fails or the native call itself fails.
      */
     private static Compressed tryMmapNativeDeflate(Entry e, long nativeHandle) {
-        int size = (int) e.size; // safe: caller already checked e.size <= MMAP_THRESHOLD
+        int size = (int) e.size; // safe: caller already checked e.size against the (<=MMAP_THRESHOLD) mmap eligibility cap
         MappedByteBuffer mapped = null;
         try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
             if (ch.size() != e.size) return null; // file changed since it was enumerated
