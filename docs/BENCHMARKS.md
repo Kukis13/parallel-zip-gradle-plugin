@@ -46,10 +46,12 @@ magic-byte skip — it STOREs content it recognizes as already-compressed (jars,
 images, etc.) rather than paying to re-deflate it, even in cases where DEFLATE would
 still have squeezed out a percent or two more than the plugin now leaves on the table.
 The trade is real and by design, not a defect: see
-[How it works](ARCHITECTURE.md#small-entry-optimizations) for why skipping that work is
-usually worth more in CPU-seconds than it costs in bytes, and use `store = true`
-instead of the default if you specifically want STORE-everywhere behavior with no
-DEFLATE attempt at all.
+[How it works](ARCHITECTURE.md#already-compressed-detection) for why skipping that work
+is usually worth more in CPU-seconds than it costs in bytes. If it costs you more than
+it's worth on a particular archive, set `skipAlreadyCompressed = false` on the task to
+fall back to always attempting DEFLATE (closer to 1.3.x's size, at the cost of most of
+this speedup) — or `store = true` if you want the opposite: STORE everything, no
+DEFLATE attempt at all, maximum speed, maximum size.
 
 Measurement confidence varies by row — most are now medians of 3–5 warm readings with
 the first (cold/compiling) reading explicitly discarded, following the methodology below.

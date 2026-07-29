@@ -27,6 +27,7 @@ import java.nio.file.Path;
  *     archiveFileName = 'dist.zip'
  *     destinationDirectory = layout.buildDirectory
  *     store = false               // true = STORE everything (fastest, ~7% larger)
+ *     skipAlreadyCompressed = true    // false = always attempt DEFLATE, 1.3.x-like size
  *     level = 6                   // DEFLATE level 0..9 (ignored when store = true)
  *     threads = 12                // default: available processors
  *     preserveFileTimestamps = false   // inherited; false = reproducible archive
@@ -46,6 +47,18 @@ public abstract class ParallelZip extends AbstractArchiveTask {
     public abstract Property<Integer> getLevel();
 
     /**
+     * When true (the default), an entry recognized by file-signature as already compressed
+     * (jars, gzip, images, and more -- see {@code ARCHITECTURE.md}) is STORED without even
+     * attempting DEFLATE. Set to {@code false} to always attempt DEFLATE regardless of
+     * signature -- matching 1.3.x's behavior, which relied only on the statistical
+     * incompressibility sniff (still active either way). Trades some of 1.4.0's speed win
+     * back for a smaller archive closer to 1.3.x's size.
+     */
+    @Input
+    @Optional
+    public abstract Property<Boolean> getSkipAlreadyCompressed();
+
+    /**
      * Number of compression threads. Default: available processors. Marked {@code @Internal}
      * because it does not affect the archive bytes (output is identical for any thread count),
      * so changing it must not invalidate the task's up-to-date state.
@@ -55,6 +68,7 @@ public abstract class ParallelZip extends AbstractArchiveTask {
 
     public ParallelZip() {
         getStore().convention(false);
+        getSkipAlreadyCompressed().convention(true);
         getLevel().convention(-1);
         getThreads().convention(Runtime.getRuntime().availableProcessors());
         getArchiveExtension().convention("zip");
@@ -68,6 +82,7 @@ public abstract class ParallelZip extends AbstractArchiveTask {
         return new ParallelZipCopyAction(
                 out,
                 getStore().get(),
+                getSkipAlreadyCompressed().get(),
                 getLevel().get(),
                 Math.max(1, getThreads().get()),
                 isPreserveFileTimestamps(),

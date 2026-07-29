@@ -165,13 +165,20 @@ public final class ParallelZipWriter {
     static Result write(List<Source> sources, Path out, boolean store, int level,
                         int threads, boolean preserveTimestamps, boolean forceZip64, long spillThreshold)
             throws IOException, InterruptedException {
+        return write(sources, out, store, true, level, threads, preserveTimestamps, forceZip64, spillThreshold);
+    }
+
+    static Result write(List<Source> sources, Path out, boolean store, boolean skipAlreadyCompressed, int level,
+                        int threads, boolean preserveTimestamps, boolean forceZip64, long spillThreshold)
+            throws IOException, InterruptedException {
         long t0 = System.nanoTime();
         List<Entry> entries = enumerate(sources, preserveTimestamps);
         long enumerateMs = (System.nanoTime() - t0) / 1_000_000L;
 
         Path spillDir = Files.createTempDirectory(prepareParent(out), ".pzip-");
         try {
-            Result r = writeEntries(entries, out, store, level, threads, forceZip64, spillThreshold, spillDir);
+            Result r = writeEntries(entries, out, store, skipAlreadyCompressed, level, threads, forceZip64,
+                    spillThreshold, spillDir);
             return new Result(r.archiveSize(), r.entryCount(), r.rawBytes(), r.storedBytes(),
                     enumerateMs, r.compressWriteMs(), r.zip64());
         } finally {
@@ -192,7 +199,13 @@ public final class ParallelZipWriter {
     public static Result writeEntries(List<Entry> entries, Path out, boolean store, int level,
                                       int threads, boolean forceZip64, long spillThreshold, Path spillDir)
             throws IOException, InterruptedException {
-        Sink sink = new Sink(out, store, level, threads, forceZip64, spillThreshold, spillDir);
+        return writeEntries(entries, out, store, true, level, threads, forceZip64, spillThreshold, spillDir);
+    }
+
+    public static Result writeEntries(List<Entry> entries, Path out, boolean store, boolean skipAlreadyCompressed,
+                                      int level, int threads, boolean forceZip64, long spillThreshold, Path spillDir)
+            throws IOException, InterruptedException {
+        Sink sink = new Sink(out, store, skipAlreadyCompressed, level, threads, forceZip64, spillThreshold, spillDir);
         for (Entry e : entries) sink.add(e);
         return sink.finish();
     }
@@ -229,6 +242,7 @@ public final class ParallelZipWriter {
         private final BlockingQueue<Item> queue;
         private final Thread writerThread;
         private final boolean store;
+        private final boolean skipAlreadyCompressed;
         private final int level;
         private final long spillThreshold;
         private final Path spillDir;
@@ -255,9 +269,10 @@ public final class ParallelZipWriter {
         private record Item(Future<List<Compressed>> future, int permits) {}
         private static final Item POISON_ITEM = new Item(null, 0);
 
-        public Sink(Path out, boolean store, int level, int threads,
+        public Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                     boolean forceZip64, long spillThreshold, Path spillDir) {
             this.store = store;
+            this.skipAlreadyCompressed = skipAlreadyCompressed;
             this.level = level;
             this.spillThreshold = spillThreshold;
             this.spillDir = spillDir;
@@ -323,8 +338,8 @@ public final class ParallelZipWriter {
             byteFlight.acquire(permits);  // backpressure on memory; released by the writer
             countFlight.acquire();
             Future<List<Compressed>> f =
-                    pool.submit(() -> compressBatch(batch, store, level, deflaters.get(), nativeHandles.get(),
-                            spillThreshold, spillDir, effectiveMmapThreshold));
+                    pool.submit(() -> compressBatch(batch, store, skipAlreadyCompressed, level, deflaters.get(),
+                            nativeHandles.get(), spillThreshold, spillDir, effectiveMmapThreshold));
             queue.put(new Item(f, permits));
         }
 
@@ -474,15 +489,16 @@ public final class ParallelZipWriter {
      * entries, or the lone trailing entry after a flush) go through the regular per-entry
      * path, which still uses the same reused native handle for a single-buffer call.
      */
-    private static List<Compressed> compressBatch(List<Entry> batch, boolean store, int level, Deflater def,
-                                                  long nativeHandle, long spillThreshold, Path spillDir,
-                                                  long mmapThreshold) {
+    private static List<Compressed> compressBatch(List<Entry> batch, boolean store, boolean skipAlreadyCompressed,
+                                                  int level, Deflater def, long nativeHandle, long spillThreshold,
+                                                  Path spillDir, long mmapThreshold) {
         if (!store && nativeHandle != 0 && batch.size() > 1) {
-            return compressBatchNative(batch, def, nativeHandle);
+            return compressBatchNative(batch, def, nativeHandle, skipAlreadyCompressed);
         }
         List<Compressed> out = new ArrayList<>(batch.size());
         for (Entry e : batch) {
-            out.add(compress(e, store, level, def, nativeHandle, spillThreshold, spillDir, mmapThreshold));
+            out.add(compress(e, store, skipAlreadyCompressed, level, def, nativeHandle, spillThreshold, spillDir,
+                    mmapThreshold));
         }
         return out;
     }
@@ -492,46 +508,70 @@ public final class ParallelZipWriter {
      * native call, reusing {@code nativeHandle} for all of them. Any entry the native call
      * can't handle falls back individually to the JDK {@link Deflater}, same as the
      * single-entry path -- one entry's failure never affects the rest of the batch.
+     *
+     * <p>Entries {@link #looksAlreadyCompressed} recognizes (when {@code skipAlreadyCompressed}
+     * is set) are stored directly here too, same as the singleton path -- pulled out of the
+     * batch before the native call so no output buffer is even allocated for them, mirroring
+     * {@link #compressBytes}'s reasoning for why bothering to try is wasted work.</p>
      */
-    private static List<Compressed> compressBatchNative(List<Entry> batch, Deflater def, long nativeHandle) {
+    private static List<Compressed> compressBatchNative(List<Entry> batch, Deflater def, long nativeHandle,
+                                                         boolean skipAlreadyCompressed) {
         int n = batch.size();
-        byte[][] raws = new byte[n][];
-        byte[][] outs = new byte[n][];
-        boolean[] empty = new boolean[n];
-        for (int i = 0; i < n; i++) {
-            byte[] raw = readSmallEntry(batch.get(i));
-            raws[i] = raw;
-            empty[i] = raw.length == 0;
-            // A distinct (not aliased) array even when empty: passing the same array
-            // object as both input and output would pin it twice under
-            // GetPrimitiveArrayCritical in the native call, which is unspecified behavior.
-            outs[i] = empty[i] ? new byte[0] : new byte[raw.length + (raw.length >> 12) + 64];
-        }
+        Compressed[] result = new Compressed[n];
+        byte[][] rawByIndex = new byte[n][];
+        List<Integer> nativeIdx = new ArrayList<>(n);
 
-        // CRC-32 is computed natively, per entry, in the same pinned-array pass as
-        // compression (see pzip_libdeflate.c) instead of a dedicated Java CRC32.update
-        // loop over every raw[] beforehand.
-        int[] outLens = new int[n];
-        long[] crcs = new long[n];
-        LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, crcs, n);
-
-        List<Compressed> result = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             Entry e = batch.get(i);
-            byte[] raw = raws[i];
-            if (empty[i]) {
-                result.add(new Compressed(e, raw, null, false, 0L, 0, 0, 0)); // CRC-32 of empty input is 0
-            } else if (outLens[i] == LibdeflateNative.STORE_SENTINEL || outLens[i] >= raw.length) {
-                // sniff judged it already-compressed, or deflate didn't help: store this entry
-                result.add(new Compressed(e, raw, null, false, crcs[i], raw.length, raw.length, 0));
-            } else if (outLens[i] <= 0) {
-                // native failed: JDK fallback, reusing the CRC the native call already computed
-                result.add(compressWithJdk(e, raw, def, crcs[i]));
+            byte[] raw = readSmallEntry(e);
+            rawByIndex[i] = raw;
+            if (raw.length == 0) {
+                result[i] = new Compressed(e, raw, null, false, 0L, 0, 0, 0); // CRC-32 of empty input is 0
+            } else if (skipAlreadyCompressed && looksAlreadyCompressed(raw, raw.length)) {
+                CRC32 crc = new CRC32();
+                crc.update(raw);
+                result[i] = new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
             } else {
-                result.add(new Compressed(e, outs[i], null, false, crcs[i], raw.length, outLens[i], 8));
+                nativeIdx.add(i);
             }
         }
-        return result;
+
+        if (!nativeIdx.isEmpty()) {
+            int m = nativeIdx.size();
+            byte[][] raws = new byte[m][];
+            byte[][] outs = new byte[m][];
+            for (int k = 0; k < m; k++) {
+                byte[] raw = rawByIndex[nativeIdx.get(k)];
+                raws[k] = raw;
+                // A distinct (not aliased) array: passing the same array object as both input
+                // and output would pin it twice under GetPrimitiveArrayCritical in the native
+                // call, which is unspecified behavior.
+                outs[k] = new byte[raw.length + (raw.length >> 12) + 64];
+            }
+
+            // CRC-32 is computed natively, per entry, in the same pinned-array pass as
+            // compression (see pzip_libdeflate.c) instead of a dedicated Java CRC32.update
+            // loop over every raw[] beforehand.
+            int[] outLens = new int[m];
+            long[] crcs = new long[m];
+            LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, crcs, m);
+
+            for (int k = 0; k < m; k++) {
+                int i = nativeIdx.get(k);
+                Entry e = batch.get(i);
+                byte[] raw = raws[k];
+                if (outLens[k] == LibdeflateNative.STORE_SENTINEL || outLens[k] >= raw.length) {
+                    // sniff judged it already-compressed, or deflate didn't help: store this entry
+                    result[i] = new Compressed(e, raw, null, false, crcs[k], raw.length, raw.length, 0);
+                } else if (outLens[k] <= 0) {
+                    // native failed: JDK fallback, reusing the CRC the native call already computed
+                    result[i] = compressWithJdk(e, raw, def, crcs[k]);
+                } else {
+                    result[i] = new Compressed(e, outs[k], null, false, crcs[k], raw.length, outLens[k], 8);
+                }
+            }
+        }
+        return List.of(result);
     }
 
     private static byte[] readSmallEntry(Entry e) {
@@ -542,26 +582,26 @@ public final class ParallelZipWriter {
         }
     }
 
-    private static Compressed compress(Entry e, boolean store, int level, Deflater def,
-                                       long nativeHandle, long spillThreshold, Path spillDir,
+    private static Compressed compress(Entry e, boolean store, boolean skipAlreadyCompressed, int level,
+                                       Deflater def, long nativeHandle, long spillThreshold, Path spillDir,
                                        long mmapThreshold) {
         try {
             if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
             if (e.inline != null) {
-                return compressBytes(e, e.inline, store, def, nativeHandle);
+                return compressBytes(e, e.inline, store, skipAlreadyCompressed, def, nativeHandle);
             }
             if (e.size > spillThreshold) {
-                return compressLarge(e, store, level, spillDir, nativeHandle, mmapThreshold);
+                return compressLarge(e, store, skipAlreadyCompressed, level, spillDir, nativeHandle, mmapThreshold);
             }
-            return compressBytes(e, Files.readAllBytes(e.file), store, def, nativeHandle);
+            return compressBytes(e, Files.readAllBytes(e.file), store, skipAlreadyCompressed, def, nativeHandle);
         } catch (IOException ex) {
             throw new RuntimeException("Failed to compress " + e.name, ex);
         }
     }
 
-    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, Deflater def,
-                                            long nativeHandle) {
-        if (store || raw.length == 0 || looksAlreadyCompressed(raw, raw.length)) {
+    private static Compressed compressBytes(Entry e, byte[] raw, boolean store, boolean skipAlreadyCompressed,
+                                            Deflater def, long nativeHandle) {
+        if (store || raw.length == 0 || (skipAlreadyCompressed && looksAlreadyCompressed(raw, raw.length))) {
             CRC32 crc = new CRC32();
             crc.update(raw);
             return new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
@@ -666,9 +706,10 @@ public final class ParallelZipWriter {
     static final int SNIFF_KEEP_PCT = 98; // store when the probe compresses to >= this % of its size
 
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
-    private static Compressed compressLarge(Entry e, boolean store, int level, Path spillDir,
-                                            long nativeHandle, long mmapThreshold) throws IOException {
-        if (store || looksAlreadyCompressed(e.file) || looksIncompressible(e.file, e.size, level)) {
+    private static Compressed compressLarge(Entry e, boolean store, boolean skipAlreadyCompressed, int level,
+                                            Path spillDir, long nativeHandle, long mmapThreshold) throws IOException {
+        if (store || (skipAlreadyCompressed && looksAlreadyCompressed(e.file))
+                || looksIncompressible(e.file, e.size, level)) {
             CRC32 crc = new CRC32();
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);

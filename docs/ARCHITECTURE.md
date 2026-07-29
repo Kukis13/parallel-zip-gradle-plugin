@@ -45,10 +45,29 @@ Together, on many-small-file archives, these turned what used to be the one case
 DEFLATE was *slower* than single-threaded `Zip` into one of the largest speedups
 measured (see [Benchmarks](BENCHMARKS.md)).
 
+## Already-compressed detection
+
+Beyond the statistical safety net below, entries are also checked by file signature —
+the leading bytes of jars/wars/ears/zips, gzip, bzip2, xz, 7-zip, zstd, rar, lz4, png,
+jpeg, gif, webp, mp4/mov/m4a (ISO-BMFF), webm/mkv, ogg, and woff/woff2 are all
+recognized. A match STOREs the entry immediately, without even attempting DEFLATE —
+cheaper and more reliable than the statistical probe below, which only samples an
+entry's head and can be fooled by a container whose first few bytes aren't
+representative of its bulk content (a jar's `META-INF/MANIFEST.MF`, for instance).
+
+This is on by default (`skipAlreadyCompressed = true`) and is the single biggest
+contributor to this plugin's speed on jar-heavy distributions (see
+[Benchmarks](BENCHMARKS.md)) — but it trades some archive size for that speed: content
+DEFLATE could still have squeezed a percent or two smaller is now STORED as-is instead.
+Set `skipAlreadyCompressed = false` on the task to always attempt DEFLATE regardless of
+signature — closer to pre-1.4.0 size, at the cost of most of this optimization's speed.
+The statistical sniff below stays active either way.
+
 ## Safety nets
 
-Per-entry: if DEFLATE would make an entry *larger* (already-compressed data), that
-entry is automatically STORED instead, so output is never bigger than necessary.
+Per-entry: if DEFLATE would make an entry *larger* (already-compressed data, past what
+the signature check above already caught), that entry is automatically STORED instead,
+so output is never bigger than necessary.
 
 Archive-level: archives beyond the standard ZIP limits — over 4 GiB, over 65,535
 entries, or per-entry offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields

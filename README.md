@@ -29,8 +29,10 @@ in the build warm/cached.
 Geometric-mean speedup across nine real production Zip tasks measured this way: **~26.5×**.
 That's traded for archive size: `ParallelZip` output runs 6–17% larger than stock across
 these nine projects, the direct cost of skipping re-compression on content it recognizes
-as already compressed. Full breakdown, methodology, and the fixed-corpus (static
-directory tree, four codecs) benchmarks → **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+as already compressed. Set `skipAlreadyCompressed = false` if that trade isn't worth it
+for a given archive — it falls back to always attempting DEFLATE, closer to 1.3.x's size
+at the cost of most of this speedup. Full breakdown, methodology, and the fixed-corpus
+(static directory tree, four codecs) benchmarks → **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Usage
 
@@ -54,6 +56,7 @@ tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {
     destinationDirectory = layout.buildDirectory
 
     store = false                    // true = STORE everything (fastest, ~7% larger)
+    skipAlreadyCompressed = true     // false = always attempt DEFLATE, 1.3.x-like size
     level = 6                        // DEFLATE level 0..9 (ignored when store = true)
     threads = 12                     // default: available processors
     preserveFileTimestamps = false   // inherited from AbstractArchiveTask; false = reproducible
@@ -68,6 +71,7 @@ Everything on `Zip`/`AbstractArchiveTask` applies (`from`, `into`, `include`, `e
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `store` | `boolean` | `false` | STORE all entries (no DEFLATE). Fastest; ~7% larger. |
+| `skipAlreadyCompressed` | `boolean` | `true` | STORE entries recognized by file signature as already compressed (jars, gzip, images, …) instead of attempting DEFLATE. Set `false` for 1.3.x-like behavior: always attempt DEFLATE, smaller archives, less speedup. |
 | `level` | `int` | `-1` (zlib default 6) | DEFLATE level `0..9`. |
 | `threads` | `int` | available processors | Compression worker threads. Does not affect output bytes. |
 

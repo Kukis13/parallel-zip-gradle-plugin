@@ -11,6 +11,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * A signature match must win even when the entry's body would otherwise look statistically
@@ -79,6 +80,89 @@ class ParallelZipWriterMagicBytesTest {
         try (ZipFile zf = new ZipFile(out.toFile())) {
             assertEquals(ZipEntry.STORED, zf.getEntry("archive.tar.gz").getMethod(),
                     "gzip-signature entry must be STOREd even though its body deflates well");
+        }
+    }
+
+    @Test
+    void smallInMemoryEntryWithZipMagicIsDeflatedWhenSkipDisabled() throws Exception {
+        Path src = tmp.resolve("small-src-noskip");
+        Files.createDirectories(src);
+        Files.write(src.resolve("nested.jar"), fakeZipWithCompressibleBody(2_000));
+
+        Path out = tmp.resolve("small-noskip.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, false, -1, 4, false, false, ParallelZipWriter.SPILL_THRESHOLD);
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            assertEquals(ZipEntry.DEFLATED, zf.getEntry("nested.jar").getMethod(),
+                    "skipAlreadyCompressed=false must still DEFLATE a compressible body despite the ZIP signature");
+        }
+    }
+
+    @Test
+    void largeFileBackedEntryWithGzipMagicIsDeflatedWhenSkipDisabled() throws Exception {
+        Path src = tmp.resolve("large-src-noskip");
+        Files.createDirectories(src);
+        Files.write(src.resolve("archive.tar.gz"), fakeGzipWithCompressibleBody(200_000));
+
+        Path out = tmp.resolve("large-noskip.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, false, -1, 4, false, false, 1_000);
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            assertEquals(ZipEntry.DEFLATED, zf.getEntry("archive.tar.gz").getMethod(),
+                    "skipAlreadyCompressed=false must still DEFLATE a compressible body despite the gzip signature");
+        }
+    }
+
+    /**
+     * Regression test: {@link ParallelZipWriter.Sink}'s multi-entry native batch path
+     * ({@code compressBatchNative}) used to call the native compressor directly with no
+     * magic-byte check at all, so small already-compressed entries batched together (unlike
+     * the singleton {@code compressBytes} path exercised by the tests above) were never
+     * signature-STOREd -- only whatever the native call's own statistical sniff caught. Five
+     * small entries here comfortably clear the multi-entry native batch threshold.
+     */
+    @Test
+    void multipleSmallEntriesWithZipMagicAreStoredViaNativeBatchPath() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        Path src = tmp.resolve("batch-src");
+        Files.createDirectories(src);
+        for (int i = 0; i < 5; i++) {
+            Files.write(src.resolve("nested" + i + ".jar"), fakeZipWithCompressibleBody(500));
+        }
+
+        Path out = tmp.resolve("batch.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, -1, 4, false);
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            for (int i = 0; i < 5; i++) {
+                assertEquals(ZipEntry.STORED, zf.getEntry("nested" + i + ".jar").getMethod(),
+                        "a ZIP-signature entry inside a multi-entry native batch must be STOREd too");
+            }
+        }
+    }
+
+    /** As above, but confirms the flag also governs entries routed through the batch path. */
+    @Test
+    void multipleSmallEntriesWithZipMagicAreDeflatedViaNativeBatchPathWhenSkipDisabled() throws Exception {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        Path src = tmp.resolve("batch-src-noskip");
+        Files.createDirectories(src);
+        for (int i = 0; i < 5; i++) {
+            Files.write(src.resolve("nested" + i + ".jar"), fakeZipWithCompressibleBody(500));
+        }
+
+        Path out = tmp.resolve("batch-noskip.zip");
+        var sources = List.of(new ParallelZipWriter.Source(src, ""));
+        ParallelZipWriter.write(sources, out, false, false, -1, 4, false, false, ParallelZipWriter.SPILL_THRESHOLD);
+
+        try (ZipFile zf = new ZipFile(out.toFile())) {
+            for (int i = 0; i < 5; i++) {
+                assertEquals(ZipEntry.DEFLATED, zf.getEntry("nested" + i + ".jar").getMethod(),
+                        "skipAlreadyCompressed=false must still DEFLATE batched entries despite the ZIP signature");
+            }
         }
     }
 

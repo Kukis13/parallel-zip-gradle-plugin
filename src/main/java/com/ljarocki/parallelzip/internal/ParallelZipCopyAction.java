@@ -37,15 +37,17 @@ public final class ParallelZipCopyAction implements CopyAction {
 
     private final Path archive;
     private final boolean store;
+    private final boolean skipAlreadyCompressed;
     private final int level;
     private final int threads;
     private final boolean preserveTimestamps;
     private final long spillThreshold;
 
-    public ParallelZipCopyAction(Path archive, boolean store, int level, int threads,
+    public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                                  boolean preserveTimestamps, long spillThreshold) {
         this.archive = archive;
         this.store = store;
+        this.skipAlreadyCompressed = skipAlreadyCompressed;
         this.level = level;
         this.threads = threads;
         this.preserveTimestamps = preserveTimestamps;
@@ -61,8 +63,8 @@ public final class ParallelZipCopyAction implements CopyAction {
             throw new UncheckedIOException(e);
         }
         try {
-            ParallelZipWriter.Sink sink =
-                    new ParallelZipWriter.Sink(archive, store, level, threads, false, spillThreshold, spillDir);
+            ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
+                    archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir);
             stream.process(details -> {
                 try {
                     sink.add(toEntry(details, spillDir));
