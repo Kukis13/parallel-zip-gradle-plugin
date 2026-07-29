@@ -4,6 +4,7 @@ import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.provider.Property;
+import org.gradle.api.tasks.CacheableTask;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Optional;
@@ -33,7 +34,17 @@ import java.nio.file.Path;
  *     preserveFileTimestamps = false   // inherited; false = reproducible archive
  * }
  * </pre>
+ *
+ * <p>Marked {@link CacheableTask}, unlike Gradle's own {@code Zip}/{@code AbstractArchiveTask}
+ * (both {@code @DisableCachingByDefault} upstream -- {@code Zip} explicitly "not worth
+ * caching", a judgment call from when archive packaging was assumed cheap). This task already
+ * produces byte-for-byte reproducible output for identical inputs and correctly separates
+ * {@code @Input} properties (affect the archive bytes) from {@code @Internal} ones ({@code
+ * threads}, which doesn't), so participating in the build cache is safe: an unchanged rebuild
+ * can skip both the copy-walk and compression entirely via a cache hit instead of re-paying for
+ * either.</p>
  */
+@CacheableTask
 public abstract class ParallelZip extends AbstractArchiveTask {
 
     /** When true, every entry is STORED (no compression). Default: false. */

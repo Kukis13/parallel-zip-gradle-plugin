@@ -2,6 +2,7 @@ package com.ljarocki.parallelzip;
 
 import org.gradle.testkit.runner.BuildResult;
 import org.gradle.testkit.runner.GradleRunner;
+import org.gradle.testkit.runner.TaskOutcome;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -11,6 +12,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HexFormat;
 import java.util.zip.ZipEntry;
@@ -29,6 +31,27 @@ class ParallelZipFunctionalTest {
 
     private void settings() throws IOException {
         Files.writeString(projectDir.resolve("settings.gradle"), "rootProject.name = 'sample'\n");
+    }
+
+    /** As {@link #settings()}, plus a self-contained local build cache under the temp project. */
+    private void settingsWithBuildCache() throws IOException {
+        Files.writeString(projectDir.resolve("settings.gradle"), """
+                rootProject.name = 'sample'
+                buildCache {
+                    local {
+                        directory = new File(rootDir, 'build-cache')
+                    }
+                }
+                """);
+    }
+
+    private static void deleteRecursively(Path root) throws IOException {
+        if (!Files.exists(root)) return;
+        try (var s = Files.walk(root)) {
+            s.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) { }
+            });
+        }
     }
 
     private void buildFile(String taskBody) throws IOException {
@@ -183,6 +206,31 @@ class ParallelZipFunctionalTest {
         String props = readEntry(zip, "app/conf/app.properties");
         assertTrue(props.contains("version=1.2.3"), "filter replaced token: " + props);
         assertFalse(props.contains("@version@"), "token should be gone");
+    }
+
+    /**
+     * Unlike Gradle's own {@code Zip} ({@code @DisableCachingByDefault}), {@code ParallelZip}
+     * is marked {@code @CacheableTask}. Runs the same task twice against an unchanged input
+     * tree, wiping the local build state (not just the output file) between runs so the second
+     * run can only succeed via a genuine cache restore, not an up-to-date short-circuit -- then
+     * confirms the outcome is {@code FROM_CACHE} and the restored archive is still correct.
+     */
+    @Test
+    void isCacheable() throws Exception {
+        settingsWithBuildCache();
+        sampleTree();
+        buildFile("    from 'staging'\n    threads = 4\n");
+
+        BuildResult first = run("dist", "--build-cache");
+        assertEquals(TaskOutcome.SUCCESS, first.task(":dist").getOutcome(),
+                "first run must actually execute, not restore from a pre-existing cache");
+
+        deleteRecursively(projectDir.resolve("build"));
+
+        BuildResult second = run("dist", "--build-cache");
+        assertEquals(TaskOutcome.FROM_CACHE, second.task(":dist").getOutcome(),
+                "second run with unchanged inputs must be restored from the build cache");
+        assertEquals(5, verifyAllEntries(archive()), "cache-restored archive must still be valid");
     }
 
     /**

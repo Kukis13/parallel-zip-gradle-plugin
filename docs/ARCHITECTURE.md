@@ -63,6 +63,19 @@ Set `skipAlreadyCompressed = false` on the task to always attempt DEFLATE regard
 signature — closer to pre-1.4.0 size, at the cost of most of this optimization's speed.
 The statistical sniff below stays active either way.
 
+## Build cache
+
+`ParallelZip` is `@CacheableTask` — unlike Gradle's own `Zip`/`AbstractArchiveTask`, both
+`@DisableCachingByDefault` upstream (`Zip`'s own reason: "Not worth caching", a judgment call
+from when archive packaging was assumed cheap; this plugin exists because that assumption
+doesn't hold for large real-world archives). With `org.gradle.caching=true` (or `--build-cache`),
+an unchanged rebuild restores the archive from the build cache instead of re-running the copy-walk
+and compression at all — the biggest available win for repeat builds, bigger than anything the
+compression pipeline itself can offer. This is safe here specifically because the task already
+produces byte-for-byte reproducible output for identical inputs (see [Reproducibility](REPRODUCIBILITY.md))
+and already separates `@Input` properties (`store`, `level`, `skipAlreadyCompressed` — affect the
+archive bytes) from `@Internal` ones (`threads` — doesn't).
+
 ## Safety nets
 
 Per-entry: if DEFLATE would make an entry *larger* (already-compressed data, past what
