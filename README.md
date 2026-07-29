@@ -20,17 +20,17 @@ in the build warm/cached.
 
 | Project | Task | Stock `Zip` | `ParallelZip` | Speedup |
 |---|---|--:|--:|--:|
-| Micronaut Starter (Launch) CLI | `distZip` | 0.757 s | 0.070 s | **10.89×** |
-| JBake | `jbake-dist:distZip` | 2.915 s | 0.290 s | **10.05×** |
-| Gradle (the build tool) | `distributions-full:binDistributionZip` | 3.690 s | 0.815 s | **4.53×** |
-| SonarQube 26.6 | `sonar-application:zip` | 24.991 s | 8.520 s | **2.93×** |
-| JBang | `distZip` | 0.404 s | 0.126 s | **3.21×** |
+| JBake | `jbake-dist:distZip` | 2.338 s | 0.046 s | **50.53×** |
+| Micronaut Starter (Launch) CLI | `distZip` | 0.778 s | 0.020 s | **39.32×** |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.026 s | 0.142 s | **28.35×** |
+| JBang | `distZip` | 0.296 s | 0.012 s | **25.47×** |
+| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s | **5.89×** |
 
-Geometric-mean speedup across nine real production Zip tasks measured this way: **~4.3×**.
-Archive sizes matched within ~1–5% of the stock task in every case.
-
-Full methodology, all rows, and the fixed-corpus (static directory tree, four codecs)
-benchmarks → **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+Geometric-mean speedup across nine real production Zip tasks measured this way: **~26.5×**.
+That's traded for archive size: `ParallelZip` output runs 6–17% larger than stock across
+these nine projects, the direct cost of skipping re-compression on content it recognizes
+as already compressed. Full breakdown, methodology, and the fixed-corpus (static
+directory tree, four codecs) benchmarks → **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Usage
 
