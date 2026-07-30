@@ -57,11 +57,13 @@ representative of its bulk content (a jar's `META-INF/MANIFEST.MF`, for instance
 
 This is on by default (`skipAlreadyCompressed = true`) and is the single biggest
 contributor to this plugin's speed on jar-heavy distributions (see
-[Benchmarks](BENCHMARKS.md)) — but it trades some archive size for that speed: content
-DEFLATE could still have squeezed a percent or two smaller is now STORED as-is instead.
-Set `skipAlreadyCompressed = false` on the task to always attempt DEFLATE regardless of
-signature — closer to pre-1.4.0 size, at the cost of most of this optimization's speed.
-The statistical sniff below stays active either way.
+[Benchmarks](BENCHMARKS.md)) — but it trades real archive size for that speed, and the
+two modes differ enough that both are worth knowing, not just the default: measured
+across 20 real projects, `skipAlreadyCompressed = true` runs **4–17% larger** than stock
+`Zip` for a 6–46× speedup, while `skipAlreadyCompressed = false` (always attempt DEFLATE
+regardless of signature, relying only on the statistical sniff below) stays within about
+**1% of stock size** for a still-substantial 2–14× speedup. Pick `false` on the task when
+archive size matters more than shaving the last bit of time off an already-fast task.
 
 ## Build cache
 
@@ -86,6 +88,20 @@ Archive-level: archives beyond the standard ZIP limits — over 4 GiB, over 65,5
 entries, or per-entry offsets/sizes beyond 4 GiB — automatically get ZIP64 extra fields
 and end-of-central-directory records, validated against both `java.util.zip` and a
 non-Java (.NET) reader.
+
+Memory: the amount of in-flight compression buffering is capped at a fraction of the
+Gradle daemon's heap (`maxMemory / 6`, clamped between 16 MiB and 1 GiB), and the
+mmap fast path's per-entry buffer size scales down further on small heaps instead of
+staying fixed at its 128 MiB ceiling — so a handful of large entries in flight can't
+turn into oversized allocations that fragment a small heap toward `OutOfMemoryError`.
+If the daemon's max heap looks too small for comfortable use (under ~2 GiB), a one-time
+warning is logged pointing at `org.gradle.jvmargs`.
+
+Windows file locking: large entries compressed via the mmap fast path used to leave
+their source file locked against deletion or rewrite until garbage collection got
+around to releasing the mapping — unbounded, and occasionally still held by the time a
+later task in the same long-lived Gradle daemon tried to touch that same file. The
+mapping is now released explicitly right after the native call returns, not left for GC.
 
 See also: [Benchmarks](BENCHMARKS.md) · [Compatibility](COMPATIBILITY.md) ·
 [Reproducibility](REPRODUCIBILITY.md) · [Development](DEVELOPMENT.md)

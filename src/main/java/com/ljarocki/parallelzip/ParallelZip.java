@@ -27,8 +27,9 @@ import java.nio.file.Path;
  *     into 'myapp-1.0'
  *     archiveFileName = 'dist.zip'
  *     destinationDirectory = layout.buildDirectory
- *     store = false               // true = STORE everything (fastest, ~7% larger)
- *     skipAlreadyCompressed = true    // false = always attempt DEFLATE, 1.3.x-like size
+ *     store = false               // true = STORE everything (fastest; size cost varies
+ *                                 // widely by content, +4% to +107% measured -- see docs)
+ *     skipAlreadyCompressed = true    // false = always attempt DEFLATE, near-stock size
  *     level = 6                   // DEFLATE level 0..9 (ignored when store = true)
  *     threads = 12                // default: available processors
  *     preserveFileTimestamps = false   // inherited; false = reproducible archive
@@ -62,8 +63,10 @@ public abstract class ParallelZip extends AbstractArchiveTask {
      * (jars, gzip, images, and more -- see {@code ARCHITECTURE.md}) is STORED without even
      * attempting DEFLATE. Set to {@code false} to always attempt DEFLATE regardless of
      * signature -- matching 1.3.x's behavior, which relied only on the statistical
-     * incompressibility sniff (still active either way). Trades some of 1.4.0's speed win
-     * back for a smaller archive closer to 1.3.x's size.
+     * incompressibility sniff (still active either way). Measured across 20 real projects
+     * ({@code docs/BENCHMARKS.md}): {@code true} runs 4-17% larger than stock {@code Zip}
+     * for a 6-46x speedup; {@code false} stays within about 1% of stock size (one outlier
+     * at +5%) for a 2-14x speedup -- both comfortably faster than stock either way.
      */
     @Input
     @Optional

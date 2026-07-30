@@ -1,12 +1,12 @@
-project	task	stockZipMs	v1.3.0ParallelZipMs	v1.4.0ParallelZipMs	stockSizeBytes	v1.3.0SizeBytes	v1.4.0SizeBytes	confidence	notes
-JBake	:jbake-dist:distZip	2337.6	324.8	46.3	90670297	90891609	97283322	medium	3 warm readings each, first (cold) discarded; JDK 17 daemon required (Gradle 7.3.3 wrapper)
-Groovy	:groovy-binary:distBin	1823.5	185.5	41.3	47929783	47819923	52951725	low	sub-2s task, noisy (+-40%+ run to run); medians of 3-4 warm readings
-Micronaut Starter CLI	:micronaut-cli:distZip	777.8	71.6	19.8	32710359	34345423	37001029	medium	3 warm readings each, first discarded as outlier; JDK 25 daemon required
-Gradle Profiler	:distZip	803	137	24	35241710	35161550	38108064	medium	5 readings, first (cold) discarded
-Gradle (the tool)	:distributions-full:binDistributionZip	4026	820	142	150458874	151854055	168539604	high	5 readings for stock/1.4.0 (first cold discarded), 3 for 1.3.0; Isolated Projects enabled, JDK 25 daemon
-JBang	:distZip	295.8	143.0	11.6	13456948	13416938	14917936	medium	3 warm readings each, first discarded as outlier
-Spring Boot CLI	:cli:spring-boot-cli:zip	175.07	72.85	7.13	7405499	7384256	8652099	medium	5 readings, first (cold) discarded; JDK 25 daemon required
-Grails CLI	:grails-shell-cli:distZip	1288	160.6	60.7	56776056	56650593	62940875	high	3 warm readings each, tight/consistent; JDK 21 daemon
-SonarQube	:sonar-application:zip	23310	5560	3960	931980721	939154091	990335547	high	3 warm readings each after 1 cold discarded, very tight/consistent
+project	task	stockZipMs	skipTrueMs	skipFalseMs	stockSizeBytes	skipTrueSizeBytes	skipFalseSizeBytes	confidence	notes
+JBake	:jbake-dist:distZip	2964.5	68.6	368.0	90670297	97424591	90891609	medium	JDK 17 daemon required (Gradle 7.3.3 wrapper)
+Gradle Profiler	:distZip	1078	37	184	35241710	38164115	35161550	medium	4 warm readings, first cold discarded; JDK 21.0.1
+Gradle (the tool)	:distributions-full:binDistributionZip	4000.5	138	846	150458875	169051255	151854054	high	Isolated Projects/config-cache enabled; JDK 25 auto-selected via gradle-daemon-jvm.properties
+Spring Boot CLI	:cli:spring-boot-cli:zip	250.99	9.76	97.75	7405499	8652099	7384256	medium	JDK 25 daemon required
+JBang	:distZip	375.5	16.95	162.5	13456948	14917936	13416938	medium	JDK 21+ on PATH
+Grails CLI	:grails-shell-cli:distZip	1840.65	83.45	177.93	56776056	63051743	56650593	high	3 warm readings each, tight/consistent; JDK 21 daemon
+Groovy	:groovy-binary:distBin	1380.04	67.31	253.98	47929783	53068431	47819923	high	3 warm readings each, tight/consistent
+Micronaut Starter CLI	:micronaut-cli:distZip	1046.5	72.22	89.04	32710359	37032781	34345423	low	true-mode readings noisy (30-100ms range); JDK 25 daemon required
+SonarQube	:sonar-application:zip	23310	3960	5560	931980721	990335547	939154091	high	3 warm readings each, very tight/consistent
 Corda	buildCordappDependenciesZip	SKIPPED	SKIPPED	SKIPPED				n/a	task is broken on current HEAD (resolves non-resolvable testImplementation config), pre-existing bug unrelated to parallel-zip
 Kotlin/Native	distNativeSources / samplesZip	SKIPPED	SKIPPED	SKIPPED				n/a	Kotlin/Native compiler build too heavy to finish in reasonable time

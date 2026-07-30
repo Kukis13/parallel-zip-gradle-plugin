@@ -1,6 +1,7 @@
 # Third-party notices
 
-The bundled `linux-x64`/`windows-x64` native accelerators statically link
+The bundled native accelerators for `linux-x64`, `linux-arm64`, `windows-x64`,
+`windows-arm64`, `macos-arm64`, and `macos-x64` statically link
 [libdeflate](https://github.com/ebiggers/libdeflate) (vendored at
 `src/main/native/libdeflate/`, version 1.25), used under the MIT license:
 

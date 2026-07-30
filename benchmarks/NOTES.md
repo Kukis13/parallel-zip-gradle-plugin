@@ -1,17 +1,24 @@
 # In-build benchmark notes
 
-Raw results: `results/gradle-inbuild.tsv`. As of the 1.4.0 benchmark refresh, "stock" is
-plain Gradle `Zip`, and the two `ParallelZip` columns compare the real published v1.3.0
-jar (downloaded from the Gradle Plugin Portal's maven layout, so it carries all six
-platforms' native accelerators as actually released) against a locally built v1.4.0 jar
-(windows-x64 native only — fine for benchmarking on Windows). Jars aren't committed here
-(they'd go stale against source) — rebuild before a rerun with, from the plugin root:
-`./gradlew jar` for the native variant (needs a C toolchain, e.g. MSVC or MinGW
-`gcc`/`cmake`, on `PATH`), or `./gradlew jar -x compileNativeDeflate` after clearing
-`build/native/out` for a JDK-only variant. Point each project's injected `buildscript {
-dependencies { classpath files('...') } }` block at whichever jar you're benchmarking —
-several projects now parameterize this via `project.findProperty('pzipJar')` so the jar
-can be swapped with `-PpzipJar=...` instead of editing the file each time.
+Raw results: `results/gradle-inbuild.tsv`. As of the 1.4.1 benchmark refresh, "stock" is
+plain Gradle `Zip`, and the two `ParallelZip` columns are the *same* locally built 1.4.1
+jar (windows-x64 native only — fine for benchmarking on Windows) run with
+`skipAlreadyCompressed=true` (default) vs `false` — isolating the flag's effect, not a
+version-to-version comparison (that's a separate, earlier exercise; see git history for
+the 1.3.0-vs-1.4.0 refresh if you need it). Jars aren't committed here (they'd go stale
+against source) — rebuild before a rerun with, from the plugin root: `./gradlew jar`
+(needs a C toolchain, e.g. MSVC or MinGW `gcc`/`cmake`, on `PATH` for the native variant).
+Point each project's injected `buildscript { dependencies { classpath files('...') } }`
+block at whichever jar you're benchmarking — projects parameterize this via
+`project.findProperty('pzipJar')` so the jar can be swapped with `-PpzipJar=...` instead
+of editing the file each time. **Pass it explicitly on every invocation, including "stock"
+runs** — the `buildscript` block resolves unconditionally at configuration time regardless
+of which task you actually run, so relying on the file's hardcoded default risks silently
+benchmarking a stale jar.
+
+The `skipAlreadyCompressed` flag itself is set the same way, via
+`project.findProperty('pzipSkip')` on each project's `parZip`/`parDistZip`/`parDistBin`
+task registration: `-PpzipSkip=true` (default if omitted) or `-PpzipSkip=false`.
 
 Lessons learned doing this by hand for 9 projects, worth encoding if this gets automated:
 

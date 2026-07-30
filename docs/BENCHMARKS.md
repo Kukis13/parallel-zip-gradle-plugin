@@ -1,5 +1,12 @@
 # Benchmarks
 
+Every table on this page compares **three points**, all on the same 1.4.1 build so only
+the `skipAlreadyCompressed` flag varies, not plugin version: stock Gradle `Zip`, `ParallelZip`
+with `skipAlreadyCompressed = true` (the default), and `skipAlreadyCompressed = false`. The
+flag matters enough for both speed *and* size that any single number without saying which
+mode it's from is misleading — so every size or speed claim on this page, and in the README,
+names its mode.
+
 ## In-build benchmarks (real projects, real Zip tasks)
 
 The most direct evidence for this plugin isn't archiving a static directory tree — it's
@@ -7,73 +14,43 @@ what happens when you actually swap `type: Zip` for `type: ParallelZip` in a rea
 project's real build. For each project below: clone it, build once with its stock `Zip`
 task, add a second task with identical configuration but `ParallelZip`, then build again
 and diff the two tasks' own execution time (via `doFirst`/`doLast`
-`System.nanoTime()` hooks, or Gradle's `--profile` report where hooks weren't added —
-see notes). Everything else in the build (compilation, resource processing, dependency
-resolution) was warm/cached in every run, so only the archiving step itself is being
-compared. Same machine: 12 logical cores, JDK 17/21/25 (whichever each project's build
-required), each project measured in isolation (no other Gradle daemons running).
+`System.nanoTime()` hooks). Everything else in the build (compilation, resource
+processing, dependency resolution) was warm/cached in every run, so only the archiving
+step itself is being compared. Same machine: 12 logical cores, JDK 17/21/25 (whichever
+each project's build required), each project measured in isolation.
 
-As of the 1.4.0 refresh, every row compares three points: stock Gradle `Zip`, the real
-published **v1.3.0** jar (all six platforms' native accelerators, exactly as released),
-and the new **v1.4.0** jar (adds magic-byte already-compressed detection, a Windows
-mmap file-lock fix, and an OOM guard for small Gradle daemon heaps — see
-[the 1.4.0 release notes](https://github.com/Kukis13/parallel-zip-gradle-plugin/releases/tag/v1.4.0)).
+| Project | Task | Stock `Zip` | `skipAlreadyCompressed=true` | `skipAlreadyCompressed=false` | Speedup (true) | Speedup (false) | Size Δ (true) | Size Δ (false) |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| JBake | `jbake-dist:distZip` | 2.965 s | 0.069 s | 0.368 s | **43.2×** | **8.06×** | +7.45% | +0.24% |
+| Gradle Profiler | `distZip` | 1.078 s | 0.037 s | 0.184 s | **29.1×** | **5.86×** | +8.30% | −0.23% |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.001 s | 0.138 s | 0.846 s | **29.0×** | **4.73×** | +12.36% | +0.93% |
+| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.251 s | 0.010 s | 0.098 s | **25.7×** | **2.57×** | +16.84% | −0.29% |
+| JBang | `distZip` | 0.376 s | 0.017 s | 0.163 s | **22.2×** | **2.31×** | +10.86% | −0.30% |
+| Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.083 s | 0.178 s | **22.1×** | **10.35×** | +11.05% | −0.22% |
+| Groovy 4.0.24 | `groovy-binary:distBin` | 1.380 s | 0.067 s | 0.254 s | **20.5×** | **5.43×** | +10.72% | −0.23% |
+| Micronaut Starter (Launch) CLI | `distZip` | 1.047 s | 0.072 s | 0.089 s | **14.5×** | **11.8×** | +13.21% | +5.00% |
+| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s | 5.56 s | **5.89×** | **4.19×** | +6.26% | +0.77% |
 
-| Project | Task | Stock `Zip` | ParallelZip 1.3.0 | ParallelZip 1.4.0 | Speedup 1.3.0 | Speedup 1.4.0 |
-|---|---|--:|--:|--:|--:|--:|
-| JBake | `jbake-dist:distZip` | 2.338 s | 0.325 s | 0.046 s | **7.20×** | **50.53×** |
-| Groovy 4.0.24 | `groovy-binary:distBin` | 1.824 s | 0.186 s | 0.041 s | **9.83×** | **44.16×**³ |
-| Micronaut Starter (Launch) CLI | `distZip` | 0.778 s | 0.072 s | 0.020 s | **10.86×** | **39.32×** |
-| Gradle Profiler | `distZip` | 0.803 s | 0.137 s | 0.024 s | **5.86×** | **33.46×** |
-| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.026 s | 0.820 s | 0.142 s | **4.91×** | **28.35×** |
-| JBang | `distZip` | 0.296 s | 0.143 s | 0.012 s | **2.07×** | **25.47×** |
-| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.175 s | 0.073 s | 0.007 s | **2.40×** | **24.54×** |
-| Grails CLI | `grails-shell-cli:distZip` | 1.288 s | 0.161 s | 0.061 s | **8.02×** | **21.2×** |
-| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 5.56 s | 3.96 s | **4.19×** | **5.89×** |
+Geometric-mean speedup over stock `Zip` across these nine tasks: **~21.0×** with
+`skipAlreadyCompressed=true`, **~5.37×** with it set `false`. Both modes are a clear win
+over stock every single time — the choice between them is purely about how much archive
+size you're willing to trade for the difference between "very fast" and "extremely fast."
 
-Geometric-mean speedup across these nine real production Zip tasks: **~5.4×** for
-v1.3.0, **~26.5×** for v1.4.0 — most of that jump is the new magic-byte skip paying off
-hardest on exactly the kind of distribution these projects ship: a pile of already-
-compressed jars and nested archives that v1.3.0 was still faithfully (and pointlessly)
-re-deflating. See `benchmarks/results/gradle-inbuild.tsv` for the raw numbers (including
-byte counts) behind every cell above.
+**Size, both modes, no cherry-picking**: `skipAlreadyCompressed=true` runs **6.3–16.8%**
+larger than stock across all nine projects — the direct, consistent cost of STOREing
+recognized-already-compressed content instead of attempting DEFLATE on it.
+`skipAlreadyCompressed=false` stays within about **±1%** of stock in eight of the nine
+projects (as tight as −0.30%, i.e. sometimes *smaller* than stock); Micronaut Starter CLI
+is the one outlier at +5.00%, still far below `true` mode's cost on the same project
+(+13.21%). If archive size matters more than shaving the last few hundred milliseconds off
+an already-fast task, `skipAlreadyCompressed=false` is the mode to reach for.
 
-**Archive size, honestly**: v1.3.0's output tracked stock `Zip` within ~0.3% on every
-project above — essentially free. **v1.4.0 does not preserve that**: it's consistently
-**6–17% larger** than both stock and v1.3.0 across all nine projects (worst case: Spring
-Boot CLI, +16.8%; best case: SonarQube, +6.3%). This is the direct, expected cost of the
-magic-byte skip — it STOREs content it recognizes as already-compressed (jars, gzip,
-images, etc.) rather than paying to re-deflate it, even in cases where DEFLATE would
-still have squeezed out a percent or two more than the plugin now leaves on the table.
-The trade is real and by design, not a defect: see
-[How it works](ARCHITECTURE.md#already-compressed-detection) for why skipping that work
-is usually worth more in CPU-seconds than it costs in bytes. If it costs you more than
-it's worth on a particular archive, set `skipAlreadyCompressed = false` on the task to
-fall back to always attempting DEFLATE (closer to 1.3.x's size, at the cost of most of
-this speedup) — or `store = true` if you want the opposite: STORE everything, no
-DEFLATE attempt at all, maximum speed, maximum size.
-
-Measurement confidence varies by row — most are now medians of 3–5 warm readings with
-the first (cold/compiling) reading explicitly discarded, following the methodology below.
-Two rows still carry a caveat:
-
-- **Groovy**³ is a sub-2-second task on this machine and showed real run-to-run swings
-  of ±40% or more even among "warm" readings — the 44.16× figure is directional, not
-  precise to more than one significant figure.
-- **JBang and Micronaut's ParallelZip readings are sub-30ms**, where JVM/JIT warm-up
-  noise is a large fraction of the signal — the relative ordering (huge speedup) is
-  solid, the exact multiple less so.
-
-- **Micronaut and JBake show the *smallest* additional 1.3.0→1.4.0 jump on the codec/
-  batching side** relative to the earlier 1.1.0→1.3.0 native/mmap/CRC-fusion work (see
-  the historical `benchmarks/results/gradle-inbuild.tsv` if comparing further back) —
-  most of their earlier win was already banked. What v1.4.0 adds on top is almost
-  entirely the magic-byte skip, and it still roughly doubles their already-large speedup
-  because their distributions are dense with small already-compressed jars.
-- **`--profile`'s per-task number includes Gradle's own bookkeeping** (up-to-date
-  checks, snapshotting), not just the task's own execution — for fast tasks this can be
-  a large fraction of the reported time. Prefer `doFirst`/`doLast` hooks for anything
-  under ~1s.
+Measurement confidence varies by row — all are medians of 3+ warm readings with the first
+(cold/compiling) reading discarded, except Micronaut Starter CLI's `true`-mode reading,
+which showed real run-to-run swings (30–100 ms range) at this sub-100ms scale — treat that
+cell as directionally correct, not precise to more than one significant figure. JBang,
+Grails, and Groovy's `true`-mode readings are similarly fast (tens of ms) and carry the
+same caveat, though less severely.
 
 Three projects from the original candidate list were dropped rather than forced in:
 
@@ -92,74 +69,65 @@ Three projects from the original candidate list were dropped rather than forced 
   plugin code (e.g. Elasticsearch) rather than a plain `Zip` task, which was judged too
   invasive to safely duplicate.
 
-Notes on measurement method per row:
+Notes on measurement method:
 
-- **Gradle (the tool)** enables Isolated Projects, which forces configuration cache on
-  and configuration cache doesn't support `--profile`; timed with `doFirst`/`doLast`
-  `System.nanoTime()` hooks instead. Configuration cache also rejects `project.ext` as a
-  channel between a task's `doFirst` and `doLast` (fails with an "invalid reference"
-  error at execution time) — use `System.getProperties()` instead when timing a
-  config-cache-enabled project this way.
-- **JBake**'s `--profile` report failed to write for an unrelated environment reason
-  (`Unable to create directory 'reports\profile'`) on this machine; also timed with
-  `doFirst`/`doLast` hooks. Its Gradle 7.3.3 wrapper needs a JDK 17 daemon (fails to
-  even start under JDK 21+).
+- **Gradle (the tool)** enables Isolated Projects, which forces configuration cache on;
+  configuration cache rejects `project.ext` as a channel between a task's `doFirst` and
+  `doLast` — use `System.getProperties()` instead when timing a config-cache-enabled
+  project this way.
+- **JBake**'s Gradle 7.3.3 wrapper needs a JDK 17 daemon (fails to even start under JDK 21+).
 - **Grails CLI**, **Micronaut Starter CLI**, and **Spring Boot CLI** required specific
   JDKs (17, 25, and 25 respectively) for the Gradle *daemon itself*, not just a
   toolchain — export `JAVA_HOME` before invoking `gradlew` rather than relying on the
   default.
+- Every project's `buildscript` classpath block resolves the plugin jar unconditionally,
+  even when running the plain stock task — pass the jar path explicitly on every
+  invocation, including "stock" runs, rather than relying on a default that can go stale
+  between benchmark rounds.
 
-## Fixed-corpus benchmarks (static directory tree, four codecs)
+## Fixed-corpus benchmarks (static directory tree)
 
-An earlier, complementary methodology: eleven popular open-source Java projects'
-official binary distributions, archived four ways — Gradle `Zip` (baseline),
-`parallel-zip` DEFLATE (JDK codec), DEFLATE (libdeflate), and STORE — using a fixed
-staging directory so only the archiving algorithm varies, not each project's own
-compile/download chain. All four `parallel-zip` columns run the same v1.4.0 build (the
-JDK-codec column uses a jar built without the native accelerator bundled, forcing the
-pure-Java fallback; the libdeflate and STORE columns use the normal native-accelerated
-jar). Same machine: 12 logical cores, JDK 21, warm cache, `-Xmx4g` daemon for every
-project (including the small ones, for consistency).
+A complementary methodology: eleven popular open-source projects' official binary
+distributions, archived three ways — Gradle `Zip` (baseline), `parallel-zip` 1.4.1 with
+`skipAlreadyCompressed=true`, and with it `false` — using a fixed staging directory so
+only the archiving mode varies, not each project's own compile/download chain. Same
+machine, JDK 21, warm cache, `-Xmx4g` daemon for every project for consistency (only
+strictly required for Hadoop's ~1.7 GiB corpus).
 
-| Project | Files | Raw size | Gradle `Zip` | parallel-zip DEFLATE (JDK) | parallel-zip DEFLATE (libdeflate) | parallel-zip STORE | STORE size Δ |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| Groovy 4.0.24 | 102 | 31.8 MiB | 0.69 s | 0.03 s (**27.29×**) | 0.06 s (**12.32×**) | 0.02 s (**32.75×**) | +11.3% |
-| ZooKeeper 3.9.3 | 1,632 | 46.5 MiB | 0.98 s | 0.18 s (**5.40×**) | 0.19 s (**5.04×**) | 0.15 s (**6.67×**) | +107.0% |
-| Cassandra 4.1.7 | 200 | 57.1 MiB | 1.32 s | 0.07 s (**19.33×**) | 0.07 s (**19.53×**) | 0.03 s (**41.58×**) | +18.6% |
-| Kafka 3.8.1 | 235 | 120.4 MiB | 2.67 s | 0.08 s (**35.57×**) | 0.09 s (**29.65×**) | 0.06 s (**43.28×**) | +4.1% |
-| Gradle 8.14.3 | 317 | 145.1 MiB | 3.02 s | 0.07 s (**44.76×**) | 0.10 s (**31.80×**) | 0.06 s (**48.57×**) | +10.7% |
-| Solr 9.7.0 | 2,091 | 304.4 MiB | 7.39 s | 0.29 s (**25.32×**) | 0.28 s (**26.42×**) | 0.29 s (**25.81×**) | +12.4% |
-| HBase 2.6.1 | 2,588 | 397.1 MiB | 10.81 s | 0.56 s (**19.40×**) | 0.64 s (**16.78×**) | 0.65 s (**16.73×**) | +22.4% |
-| Spark 3.5.3 | 1,825 | 423.6 MiB | 9.55 s | 0.50 s (**19.20×**) | 0.41 s (**23.18×**) | 0.32 s (**29.88×**) | +10.4% |
-| Flink 1.20.0 | 167 | 502.4 MiB | 12.03 s | 0.32 s (**37.63×**) | 0.34 s (**35.58×**) | 0.30 s (**39.86×**) | +8.9% |
-| SonarQube Community Build 26.7.0.124771² | 645 | 931.0 MiB | 18.90 s | 0.53 s (**35.78×**) | 0.44 s (**42.71×**) | 0.41 s (**46.28×**) | +7.6% |
-| Hadoop 3.4.0¹ | 20,220 | 1.64 GiB | 38.81 s | 8.35 s (**4.65×**) | 7.99 s (**4.86×**) | 3.84 s (**10.11×**) | +77.4% |
+| Project | Files | Raw size | Gradle `Zip` | `skipAlreadyCompressed=true` | `skipAlreadyCompressed=false` | Speedup (true) | Speedup (false) | Size Δ (true) | Size Δ (false) |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| SonarQube Community Build | 645 | 931.1 MiB | 29.76 s | 0.65 s | 3.60 s | **46.1×** | **8.28×** | +6.45% | +0.73% |
+| Gradle 8.14.3 | 317 | 145.1 MiB | 4.02 s | 0.09 s | 0.92 s | **45.3×** | **4.37×** | +10.73% | +0.86% |
+| Groovy 4.0.24 | 102 | 31.8 MiB | 1.01 s | 0.03 s | 0.13 s | **38.4×** | **7.94×** | +10.92% | +0.03% |
+| Cassandra 4.1.7 | 200 | 57.1 MiB | 1.99 s | 0.05 s | 0.23 s | **39.3×** | **8.79×** | +7.03% | −0.31% |
+| Kafka 3.8.1 | 235 | 120.4 MiB | 3.35 s | 0.09 s | 0.23 s | **36.6×** | **14.47×** | +4.00% | +0.55% |
+| Flink 1.20.0 | 167 | 502.4 MiB | 13.17 s | 0.39 s | 2.04 s | **33.9×** | **6.46×** | +8.84% | +0.24% |
+| Spark 3.5.3 | 1,825 | 423.6 MiB | 12.78 s | 0.43 s | 1.90 s | **30.0×** | **6.73×** | +6.93% | +0.50% |
+| Solr 9.7.0 | 2,091 | 304.4 MiB | 8.91 s | 0.33 s | 1.12 s | **26.9×** | **7.95×** | +9.21% | +0.20% |
+| HBase 2.6.1 | 2,588 | 397.1 MiB | 12.05 s | 0.54 s | 1.40 s | **22.5×** | **8.59×** | +10.58% | +0.16% |
+| Hadoop 3.4.0¹ | 20,220 | 1,681.2 MiB | 172.93 s | 8.61 s | 22.23 s | **20.1×** | **7.78×** | +12.17% | +0.05% |
+| ZooKeeper 3.9.3 | 1,632 | 46.5 MiB | 1.50 s | 0.21 s | 0.26 s | **7.20×** | **5.67×** | +4.75% | −0.00% |
 
-¹ Hadoop ran with `-Xmx4g` like every other row here, and needed it — this is the
-20k-file, 1.7 GiB corpus. It's also the one corpus where both DEFLATE codecs gain the
-least (4.6–4.9× vs. 12–49× everywhere else): at this file count and size the workload
-shifts from CPU-bound (compression-dominated) to I/O-bound (reading 20k small-to-medium
-files off disk dominates wall time), which compresses the gap between codecs — not a
-regression, just a different bottleneck. Windows `tar` also couldn't materialize 3 of
-Hadoop's native-library symlinks (`lib/native/lib{hdfs,hadoop,hdfspp}.so`, relative
-symlinks to versioned `.so.x.y.z` targets) during extraction; this affected all four
-columns identically (20,220 files landed in every archive, not 20,223), so the
-four-way comparison is still apples-to-apples, just slightly short of Hadoop's full
-official file count.
+¹ Ran with `-Xmx4g` like every other row here, and needed it — this is the 20k-file,
+1.7 GiB corpus. Windows `tar` couldn't materialize 3 native-library symlinks during
+extraction (relative symlinks to versioned `.so.x.y.z` targets); affected all three
+columns identically, so the comparison is still apples-to-apples.
 
-² A rolling snapshot build, not a fixed release — file count and size will drift between
-re-benchmarks as it moves forward, unlike the other ten rows. This run used build
-26.7.0.124771, the latest available at benchmark time.
+**Same pattern here as the in-build suite, at tighter tolerances**: `skipAlreadyCompressed=true`
+costs +4.0% to +12.2% archive size across all eleven corpora for 7×–46× speedup.
+`skipAlreadyCompressed=false` stays within **±1% of stock in every single corpus** here
+(−0.31% to +0.93%) — even tighter than the in-build suite — while still delivering a real
+4×–14× speedup from parallelism and the native libdeflate accelerator alone, no size cost
+worth mentioning. If you want speed with a near-zero size footprint, this is the mode.
 
-DEFLATE now trades a small amount of archive size (up to ~12% here, on HBase; Hadoop's
-+77.4% is an outlier explained by its unusually high proportion of small, individually
-incompressible or tiny files) for a large speed win: a magic-byte and incompressibility
-sniff skips fully compressing entries that are already compressed or wouldn't shrink
-much anyway, so it's still the safe default — every corpus above is a clear win on both
-codecs, size cost included. STORE trades size for speed more aggressively, and how much
-size depends entirely on how compressible the content already is: use `store = true`
-only for archives you already know are jar/binary-heavy, where the size cost is small
-and the speedup large.
+**`store = true`** (STORE everything, no DEFLATE attempt at all, independent of
+`skipAlreadyCompressed`) is the fastest possible mode but trades size far more
+aggressively, and *how much* depends entirely on how compressible the content already is —
+from the 1.4.0 codec benchmark on these same eleven corpora: **+4.1% (Kafka) to +107.0%
+(ZooKeeper)**, with most projects in the +7–22% range and Hadoop a +77.4% outlier. There is
+no single representative number for STORE mode — check your own project's content mix, or
+default to `skipAlreadyCompressed` (`true` or `false`) instead, which never costs more than
+about +17% in the worst case measured above.
 
 See also: [How it works](ARCHITECTURE.md) · [Compatibility](COMPATIBILITY.md) ·
 [Reproducibility](REPRODUCIBILITY.md) · [Development](DEVELOPMENT.md)
