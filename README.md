@@ -27,14 +27,22 @@ too large to summarize with one number.
 | JBang | `distZip` | 0.376 s | 0.017 s (**22.2×**, +10.9% size) | 0.163 s (**2.31×**, −0.3% size) |
 | Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.083 s (**22.1×**, +11.1% size) | 0.178 s (**10.35×**, −0.2% size) |
 | SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s (**5.89×**, +6.3% size) | 5.56 s (**4.19×**, +0.8% size) |
+| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.088 s (**3.39×**, −1.7% size) | 0.086 s (**3.50×**, −1.7% size) |
 
-Geometric-mean speedup over stock across nine real production Zip tasks: **~21.0×** with
-`skipAlreadyCompressed=true`, **~5.37×** with it `false`. The size cost follows the same
-split: `true` mode runs **6.3–16.8% larger** than stock across all nine projects; `false`
-mode stays within about **±1%** of stock in eight of nine (one outlier at +5.0%) while
-still beating stock by 2.3×–11.8×. Pick `true` for the fastest builds, `false` when
-archive size matters more than shaving the last bit of time off an already-fast task.
-Full breakdown, all nine projects, and the eleven-project fixed-corpus benchmarks →
+Not just JVM projects: the last row is a `kotlin("multiplatform")` project targeting
+`mingwX64` only, archiving a linked native `.exe` and its runtime DLLs — `ParallelZip` is a
+generic `CopySpec`/`AbstractArchiveTask` swap, so it doesn't care what's inside. It's also
+the only project here where the archive comes out *smaller* than stock, since none of its
+content matches an already-compressed signature.
+
+Geometric-mean speedup over stock across ten real production Zip tasks: **~17.5×** with
+`skipAlreadyCompressed=true`, **~5.14×** with it `false`. The size cost follows the same
+split: `true` mode ranges from **−1.7% to +16.8%** across all ten projects (negative only
+on the Kotlin/Native project, which has no already-compressed content to STORE instead of
+DEFLATE); `false` mode stays within about **±1.7%** of stock in nine of ten (one outlier at
++5.0%) while still beating stock by 2.3×–11.8×. Pick `true` for the fastest builds, `false`
+when archive size matters more than shaving the last bit of time off an already-fast task.
+Full breakdown, all ten projects, and the eleven-project fixed-corpus benchmarks →
 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Usage
@@ -75,7 +83,7 @@ Everything on `Zip`/`AbstractArchiveTask` applies (`from`, `into`, `include`, `e
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `store` | `boolean` | `false` | STORE all entries (no DEFLATE). Fastest; size cost depends entirely on content — measured +4% to +107% across 11 real projects, see [Benchmarks](docs/BENCHMARKS.md). |
-| `skipAlreadyCompressed` | `boolean` | `true` | STORE entries recognized by file signature as already compressed (jars, gzip, images, …) instead of attempting DEFLATE. `true`: +4–17% larger than stock, 6–46× faster. `false`: within ~1% of stock size (one outlier at +5%), still 2–14× faster. |
+| `skipAlreadyCompressed` | `boolean` | `true` | STORE entries recognized by file signature as already compressed (jars, gzip, images, …) instead of attempting DEFLATE. `true`: −2% to +17% vs. stock size (negative only on content with nothing already-compressed to STORE), 3–46× faster. `false`: within ~2% of stock size (one outlier at +5%), still 2–14× faster. |
 | `level` | `int` | `-1` (zlib default 6) | DEFLATE level `0..9`. |
 | `threads` | `int` | available processors | Compression worker threads. Does not affect output bytes. |
 

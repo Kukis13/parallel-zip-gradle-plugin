@@ -59,11 +59,14 @@ This is on by default (`skipAlreadyCompressed = true`) and is the single biggest
 contributor to this plugin's speed on jar-heavy distributions (see
 [Benchmarks](BENCHMARKS.md)) — but it trades real archive size for that speed, and the
 two modes differ enough that both are worth knowing, not just the default: measured
-across 20 real projects, `skipAlreadyCompressed = true` runs **4–17% larger** than stock
-`Zip` for a 6–46× speedup, while `skipAlreadyCompressed = false` (always attempt DEFLATE
-regardless of signature, relying only on the statistical sniff below) stays within about
-**1% of stock size** for a still-substantial 2–14× speedup. Pick `false` on the task when
-archive size matters more than shaving the last bit of time off an already-fast task.
+across 21 real projects, `skipAlreadyCompressed = true` runs from **2% smaller to 17%
+larger** than stock `Zip` (smaller only on archives with no already-compressed content to
+STORE in the first place — see the Kotlin/Native project in
+[Benchmarks](BENCHMARKS.md)) for a 3–46× speedup, while `skipAlreadyCompressed = false`
+(always attempt DEFLATE regardless of signature, relying only on the statistical sniff
+below) stays within about **2% of stock size** for a still-substantial 2–14× speedup. Pick
+`false` on the task when archive size matters more than shaving the last bit of time off
+an already-fast task.
 
 ## Build cache
 

@@ -30,44 +30,70 @@ each project's build required), each project measured in isolation.
 | Groovy 4.0.24 | `groovy-binary:distBin` | 1.380 s | 0.067 s | 0.254 s | **20.5×** | **5.43×** | +10.72% | −0.23% |
 | Micronaut Starter (Launch) CLI | `distZip` | 1.047 s | 0.072 s | 0.089 s | **14.5×** | **11.8×** | +13.21% | +5.00% |
 | SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s | 5.56 s | **5.89×** | **4.19×** | +6.26% | +0.77% |
+| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.088 s | 0.086 s | **3.39×** | **3.50×** | −1.69% | −1.69% |
 
-Geometric-mean speedup over stock `Zip` across these nine tasks: **~21.0×** with
-`skipAlreadyCompressed=true`, **~5.37×** with it set `false`. Both modes are a clear win
-over stock every single time — the choice between them is purely about how much archive
-size you're willing to trade for the difference between "very fast" and "extremely fast."
+The last row is the odd one out on purpose: it's the only non-JVM project in this table —
+a `kotlin("multiplatform")` project targeting `mingwX64` only, archiving a linked native
+`.exe` plus its bundled MinGW runtime DLLs, no JVM content at all (see
+[NikkyAI/dj-session-export](https://github.com/NikkyAI/dj-session-export)). None of its
+four entries match a recognized magic-byte signature, so `skipAlreadyCompressed` has no
+effect either way — both modes hit real DEFLATE via the native accelerator, which is why
+its `true`/`false` numbers are nearly identical here, unlike every JVM-heavy project above.
+It's also the only row where `ParallelZip` beats stock on size, not just speed: libdeflate
+edges out the JDK's `Deflater` by about 1.7% on this content. The takeaway isn't about
+Kotlin specifically — `ParallelZip` is a generic `CopySpec`/`AbstractArchiveTask` swap that
+doesn't care what's inside — it's that a real Kotlin/Native distribution archive is a
+perfectly ordinary `Zip` task, and (see [ARCHITECTURE.md](ARCHITECTURE.md)) an archive with
+no already-compressed content is exactly the case where the two modes converge.
 
-**Size, both modes, no cherry-picking**: `skipAlreadyCompressed=true` runs **6.3–16.8%**
-larger than stock across all nine projects — the direct, consistent cost of STOREing
-recognized-already-compressed content instead of attempting DEFLATE on it.
-`skipAlreadyCompressed=false` stays within about **±1%** of stock in eight of the nine
-projects (as tight as −0.30%, i.e. sometimes *smaller* than stock); Micronaut Starter CLI
-is the one outlier at +5.00%, still far below `true` mode's cost on the same project
-(+13.21%). If archive size matters more than shaving the last few hundred milliseconds off
-an already-fast task, `skipAlreadyCompressed=false` is the mode to reach for.
+Geometric-mean speedup over stock `Zip` across these ten tasks: **~17.5×** with
+`skipAlreadyCompressed=true`, **~5.14×** with it set `false` (both pulled down from the
+nine-JVM-project figures by the Kotlin/Native row's much smaller, sub-100ms archive, where
+fixed per-task overhead dominates and there's little already-compressed content to skip in
+the first place). Both modes are a clear win over stock every single time — the choice
+between them is purely about how much archive size you're willing to trade for the
+difference between "very fast" and "extremely fast."
+
+**Size, both modes, no cherry-picking**: `skipAlreadyCompressed=true` ranges from **−1.69%
+to +16.84%** across all ten projects — larger than stock everywhere there's
+already-compressed content to STORE instead of DEFLATE, smaller than stock on the one
+project (Kotlin/Native) that has none. `skipAlreadyCompressed=false` stays within about
+**±1%** of stock in eight of the ten projects (as tight as −0.30%, i.e. sometimes *smaller*
+than stock); Micronaut Starter CLI is the high outlier at +5.00%, and the Kotlin/Native
+project is the low outlier at −1.69% (same as its own `true`-mode number, since the flag
+doesn't change anything for content with no recognized signatures) — still far below
+`true` mode's own worst case (+13.21% on Micronaut Starter CLI). If archive size matters
+more than shaving the last few hundred milliseconds off an already-fast task,
+`skipAlreadyCompressed=false` is the mode to reach for.
 
 Measurement confidence varies by row — all are medians of 3+ warm readings with the first
 (cold/compiling) reading discarded, except Micronaut Starter CLI's `true`-mode reading,
 which showed real run-to-run swings (30–100 ms range) at this sub-100ms scale — treat that
 cell as directionally correct, not precise to more than one significant figure. JBang,
 Grails, and Groovy's `true`-mode readings are similarly fast (tens of ms) and carry the
-same caveat, though less severely.
+same caveat, though less severely. The Kotlin/Native project's readings are on the same
+sub-100ms scale (80–103 ms across both modes) and carry the same caveat.
 
-Three projects from the original candidate list were dropped rather than forced in:
+Two projects were tried and dropped rather than forced in, both for reasons unrelated to
+`parallel-zip`:
 
 - **Corda**'s only `Zip`-typed task (`buildCordappDependenciesZip`) is broken on the
-  current `master` branch independent of this plugin — it resolves a
-  non-resolvable `testImplementation` configuration, a pre-existing bug unrelated to
-  `parallel-zip`.
-- **Kotlin/Native**'s candidate tasks (`distNativeSources`, `samplesZip`) sit behind the
-  Kotlin/Native compiler's own build, one of the heaviest in the OSS Gradle ecosystem —
-  it didn't finish in a reasonable amount of time on this machine.
-- Every other candidate project investigated (Kafka, Solr, Elasticsearch, Micronaut Core,
-  Apache Beam, OkHttp, Ktor, ktlint, Nextflow, Ratpack, JReleaser, Netflix Eureka,
-  Spinnaker Orca, …) either ships a `.tar`/`.tar.gz` distribution instead of a `.zip`
-  (this plugin is ZIP-specific), has no distribution-archiving task at all (pure
-  libraries), or buries its real archive task inside custom internal Java-based Gradle
-  plugin code (e.g. Elasticsearch) rather than a plain `Zip` task, which was judged too
-  invasive to safely duplicate.
+  current `master` branch — it resolves a non-resolvable `testImplementation`
+  configuration, a pre-existing bug in Corda itself.
+- The **Kotlin compiler's own build** (JetBrains/kotlin) has genuine Kotlin/Native
+  `Zip`-typed tasks (`distNativeSources`, `samplesZip`), but they sit behind one of the
+  heaviest builds in the OSS Gradle ecosystem — it didn't finish in a reasonable amount of
+  time on this machine. This is a different project from the Kotlin/Native row in the table
+  above, which is a small, real-world Kotlin/Native *application* (not the compiler itself)
+  and built in under three minutes.
+
+Every other candidate project investigated (Kafka, Solr, Elasticsearch, Micronaut Core,
+Apache Beam, OkHttp, Ktor, ktlint, Nextflow, Ratpack, JReleaser, Netflix Eureka,
+Spinnaker Orca, …) either ships a `.tar`/`.tar.gz` distribution instead of a `.zip`
+(this plugin is ZIP-specific), has no distribution-archiving task at all (pure
+libraries), or buries its real archive task inside custom internal Java-based Gradle
+plugin code (e.g. Elasticsearch) rather than a plain `Zip` task, which was judged too
+invasive to safely duplicate.
 
 Notes on measurement method:
 
@@ -84,6 +110,17 @@ Notes on measurement method:
   even when running the plain stock task — pass the jar path explicitly on every
   invocation, including "stock" runs, rather than relying on a default that can go stale
   between benchmark rounds.
+- **dj-session-export**'s timing hooks live in a `subprojects.forEach { subproject -> ...
+  }` block; capturing `subproject` itself (rather than `subproject.name` snapshotted to a
+  local `String` first) inside a task's `doFirst`/`doLast` breaks the configuration cache
+  with "cannot serialize object of type 'LifecycleAwareProject'" — a different
+  config-cache pitfall than the `project.ext` one above, same fix pattern (capture a plain
+  value, not a Gradle model object, before the closure).
+- **dj-session-export**, like every project with `org.gradle.caching=true` and a
+  `@CacheableTask` target, needs `--rerun-tasks` on every timed invocation once the plugin
+  is at 1.4.1+ — otherwise a repeat run just restores `ParallelZip`'s output from the build
+  cache instead of re-executing, and the timing hooks (which live in `doFirst`/`doLast`)
+  never fire at all.
 
 ## Fixed-corpus benchmarks (static directory tree)
 

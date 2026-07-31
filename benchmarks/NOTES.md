@@ -20,7 +20,7 @@ The `skipAlreadyCompressed` flag itself is set the same way, via
 `project.findProperty('pzipSkip')` on each project's `parZip`/`parDistZip`/`parDistBin`
 task registration: `-PpzipSkip=true` (default if omitted) or `-PpzipSkip=false`.
 
-Lessons learned doing this by hand for 9 projects, worth encoding if this gets automated:
+Lessons learned doing this by hand for 10 projects, worth encoding if this gets automated:
 
 - **Only Gradle projects with a real `Zip`-typed task qualify.** Most large distributable
   Java server projects are Maven/Ant/SBT. Even among Gradle projects, many ship `.tar`/
@@ -78,6 +78,29 @@ Lessons learned doing this by hand for 9 projects, worth encoding if this gets a
   reported 127ms for a task whose `doFirst`/`doLast` hooks measured 67ms of actual work).
   Prefer the hooks for anything under ~1s; for slower tasks the discrepancy is
   proportionally small enough not to matter.
+- **Kotlin/Native (mingwX64) projects work the same way, no special-casing needed** —
+  `ParallelZip` is a generic `CopySpec`/`AbstractArchiveTask` swap, so a `kotlin(
+  "multiplatform")` project's real `Zip` task (e.g. one built from
+  `linkReleaseExecutableMingwX64`'s output) benchmarks exactly like a JVM project's. The
+  one thing to check per-project: whether `skipAlreadyCompressed` can even matter for that
+  content — a native `.exe`/`.dll`-only archive has nothing matching a magic-byte
+  signature, so both modes hit real DEFLATE and read as nearly identical; don't be
+  surprised when `true` and `false` come out the same on that kind of project, that's
+  correct, not a bug.
+- **Once `org.gradle.caching=true` and the plugin is 1.4.1+ (`@CacheableTask`),
+  `--rerun-tasks` is mandatory on every timed invocation**, not just a nice-to-have — a
+  cache hit skips the task's `Action` entirely, including `doFirst`/`doLast`, so the
+  timing hooks silently never fire and you get no output at all rather than a wrong
+  number. Easy to miss on a project that also enables `org.gradle.configuration-cache`,
+  since the failure mode (no `PZIP_TIMING` line) looks the same either way.
+- **A task's `doFirst`/`doLast` closure must not capture a `Project` reference** (e.g. the
+  `subproject` in a `subprojects.forEach { subproject -> ... }` loop) when the build has
+  configuration cache enabled — even via `System.getProperties()`, not just the
+  `project.ext` pitfall above. Gradle 9's `LifecycleAwareProject` isn't config-cache
+  serializable, and the failure surfaces as a **build failure that happens after the
+  task's own `doLast` already printed correct output** — easy to miss if you're only
+  grepping for the timing line and not scanning for `BUILD FAILED` too. Fix: snapshot
+  `subproject.name` to a local `val` before the closure, use that instead.
 
 If/when this becomes a real one-command framework, the automatable parts are: cloning at
 a pinned tag, building the two plugin jars, running `./gradlew projects` to resolve the

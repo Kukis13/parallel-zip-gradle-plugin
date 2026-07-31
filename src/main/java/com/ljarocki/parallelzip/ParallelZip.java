@@ -63,10 +63,11 @@ public abstract class ParallelZip extends AbstractArchiveTask {
      * (jars, gzip, images, and more -- see {@code ARCHITECTURE.md}) is STORED without even
      * attempting DEFLATE. Set to {@code false} to always attempt DEFLATE regardless of
      * signature -- matching 1.3.x's behavior, which relied only on the statistical
-     * incompressibility sniff (still active either way). Measured across 20 real projects
-     * ({@code docs/BENCHMARKS.md}): {@code true} runs 4-17% larger than stock {@code Zip}
-     * for a 6-46x speedup; {@code false} stays within about 1% of stock size (one outlier
-     * at +5%) for a 2-14x speedup -- both comfortably faster than stock either way.
+     * incompressibility sniff (still active either way). Measured across 21 real projects
+     * ({@code docs/BENCHMARKS.md}): {@code true} runs from 2% smaller (on archives with no
+     * already-compressed content to STORE) to 17% larger than stock {@code Zip}, for a
+     * 3-46x speedup; {@code false} stays within about 2% of stock size (one outlier at +5%)
+     * for a 2-14x speedup -- both comfortably faster than stock either way.
      */
     @Input
     @Optional
