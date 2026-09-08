@@ -9,13 +9,17 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -171,16 +175,51 @@ class ParallelZipFunctionalTest {
     }
 
     /**
-     * End-to-end permission round-trip: build the archive through the real Gradle task, then
-     * extract it with Info-ZIP {@code unzip} (the tool an end user on Linux/macOS actually
-     * reaches for) and assert the executable bit survived. Every other test here inspects
-     * archives via {@code java.util.zip.ZipFile}, which neither reports the "version made by"
-     * host byte nor restores Unix permissions -- which is exactly why the FAT-host bug went
-     * unnoticed until a user hit it. Skipped on Windows (no POSIX bits) and where {@code unzip}
-     * isn't on PATH.
+     * Runs on every OS, Windows included: a release built on any platform must produce an
+     * archive that a Linux/macOS user can extract with the right permissions. Permissions are
+     * set through the Gradle {@code filePermissions} / {@code dirPermissions} DSL (identical on
+     * every OS -- unlike a filesystem {@code chmod}, which Windows can't do), then the archive's
+     * raw central directory is inspected: the "version made by" host byte must be 3 (UNIX), or
+     * extractors treat the whole archive as MS-DOS/FAT and ignore the mode bits, and each
+     * entry's Unix mode must land in the high 16 bits of the external file attributes. This is
+     * the check the pre-1.4.2 suite was missing -- every other test reads archives via
+     * {@code java.util.zip.ZipFile}, which surfaces neither field.
      */
     @Test
-    void extractedFilesKeepUnixPermissions() throws Exception {
+    void archiveDeclaresUnixPermissionsOnEveryPlatform() throws Exception {
+        settings();
+        Path src = projectDir.resolve("staging");
+        Files.createDirectories(src.resolve("bin"));
+        Files.writeString(src.resolve("bin/run.sh"), "#!/bin/sh\necho hi\n");
+        Files.writeString(src.resolve("README.txt"), "hello\n");
+
+        buildFile("""
+                    from 'staging'
+                    filePermissions { unix(0744) }
+                    dirPermissions { unix(0750) }
+                """);
+        run("dist");
+
+        Map<String, int[]> cd = centralDirectory(archive()); // name -> {versionMadeBy, externalAttr}
+        assertFalse(cd.isEmpty(), "archive had no central directory entries");
+        cd.forEach((name, rec) -> {
+            assertEquals(3, rec[0] >>> 8, "version-made-by host byte must be 3 (UNIX) for " + name);
+            int mode = (rec[1] >>> 16) & 0777;
+            assertEquals(name.endsWith("/") ? 0750 : 0744, mode,
+                    "external attrs must carry the Gradle-configured Unix mode for " + name);
+        });
+        assertEquals(0744, (cd.get("bin/run.sh")[1] >>> 16) & 0777);
+        assertEquals(0750, (cd.get("bin/")[1] >>> 16) & 0777);
+    }
+
+    /**
+     * The other half, where a real POSIX filesystem exists: build through the Gradle task from
+     * genuinely {@code chmod +x} source files, extract with Info-ZIP {@code unzip} (what a user
+     * on Linux/macOS actually runs), and confirm the executable bit is really restored on disk.
+     * Skipped on Windows (no executable bit to restore) and where {@code unzip} isn't on PATH.
+     */
+    @Test
+    void unzipRestoresTheExecutableBitOnPosix() throws Exception {
         assumeTrue(!System.getProperty("os.name", "").toLowerCase().startsWith("win"),
                 "POSIX permissions are only meaningful on a POSIX filesystem");
         assumeTrue(commandAvailable("unzip"), "Info-ZIP 'unzip' is not on PATH");
@@ -222,6 +261,32 @@ class ParallelZipFunctionalTest {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    /** Parses a small (non-ZIP64) archive's central directory: entry name -> {versionMadeBy, externalAttr}. */
+    private static Map<String, int[]> centralDirectory(Path zip) throws IOException {
+        byte[] a = Files.readAllBytes(zip);
+        ByteBuffer b = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN);
+        int eocd = -1;
+        for (int i = a.length - 22; i >= 0; i--) {
+            if (b.getInt(i) == 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new IllegalStateException("no EOCD record");
+        int count = b.getShort(eocd + 10) & 0xFFFF;
+        int p = b.getInt(eocd + 16);
+        Map<String, int[]> out = new HashMap<>();
+        for (int e = 0; e < count; e++) {
+            if (b.getInt(p) != 0x02014b50) throw new IllegalStateException("bad central header at " + p);
+            int versionMadeBy = b.getShort(p + 4) & 0xFFFF;
+            int nameLen = b.getShort(p + 28) & 0xFFFF;
+            int extraLen = b.getShort(p + 30) & 0xFFFF;
+            int commentLen = b.getShort(p + 32) & 0xFFFF;
+            int externalAttr = b.getInt(p + 38);
+            String name = new String(a, p + 46, nameLen, java.nio.charset.StandardCharsets.UTF_8);
+            out.put(name, new int[]{versionMadeBy, externalAttr});
+            p += 46 + nameLen + extraLen + commentLen;
+        }
+        return out;
     }
 
     @Test
