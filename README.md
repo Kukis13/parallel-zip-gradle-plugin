@@ -53,7 +53,7 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'com.ljarocki.parallel-zip' version '1.4.1'
+    id 'com.ljarocki.parallel-zip' version '1.4.2'
 }
 
 tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {
@@ -92,6 +92,13 @@ past the standard ZIP limits (4 GiB, 65,535 entries) automatically get ZIP64 han
 no configuration needed either way. On six common platform/arch combinations, DEFLATE
 also runs through a bundled native accelerator instead of the JDK's `Deflater` — see
 [How it works](docs/ARCHITECTURE.md) for the internals of both.
+
+File permissions (including the executable bit) are carried into the archive as Unix mode
+bits and honoured by extractors on Linux/macOS, matching Gradle's own `Zip`. Gradle's
+`filePermissions` / `dirPermissions` / `eachFile` overrides apply as usual.
+(Fixed in 1.4.2 — 1.4.1 and earlier marked archives MS-DOS/FAT, so `unzip` on Linux
+dropped the executable bit. The fix changes the archive bytes, so a 1.4.2 archive is not
+byte-identical to a 1.4.1 one of the same inputs.)
 
 `ParallelZip` is also `@CacheableTask` — unlike Gradle's own `Zip`, which opts out of the
 build cache upstream. With `org.gradle.caching=true` (or `--build-cache`), an unchanged

@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -73,6 +74,20 @@ public final class ParallelZipWriter {
     static final int EOCD64_LOC_SIG = 0x07064b50;
     static final int Z64_EXTRA_ID = 0x0001;
     static final int FLAG_UTF8 = 0x0800;
+    /**
+     * High byte of the central-directory "version made by" field: host system 3 = UNIX. Without
+     * it the host reads as 0 (MS-DOS/FAT), and extractors then interpret "external file
+     * attributes" as MS-DOS attribute bits and ignore the Unix mode ({@code st_mode}) packed
+     * into the high 16 bits -- so {@code unzip} on Linux drops the executable bit off every
+     * extracted file. See PKWARE APPNOTE 4.4.2.
+     */
+    static final int MADE_BY_UNIX = 3 << 8;
+    /** Default Unix mode forced into an entry's external attributes when the front-end supplies none. */
+    static final int DEFAULT_FILE_MODE = 0644;
+    static final int DEFAULT_DIR_MODE = 0755;
+    /** {@code st_mode} type bits ({@code S_IFMT}); ORed into external attrs so extractors see a real file type. */
+    static final int S_IFREG = 0100000;
+    static final int S_IFDIR = 0040000;
     static final long MAX32 = 0xFFFFFFFFL;
     static final int MAX16 = 0xFFFF;
     /** Entries larger than this are streamed (spilled) instead of held in memory. */
@@ -939,7 +954,7 @@ public final class ParallelZipWriter {
                     int[] dt = preserveTimestamps
                             ? dosDateTime(Files.getLastModifiedTime(p).toMillis())
                             : new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
-                    int extAttr = dir ? 0x10 : 0;
+                    int extAttr = (unixMode(p, dir) << 16) | (dir ? 0x10 : 0);
                     list.add(dir
                             ? dirEntry(name, dt[0], dt[1], extAttr)
                             : fileEntry(name, p, false, Files.size(p), dt[0], dt[1], extAttr));
@@ -950,12 +965,51 @@ public final class ParallelZipWriter {
         return list;
     }
 
+    /**
+     * The source file's Unix permission bits, so the directory front-end preserves the
+     * executable bit (and the rest of {@code st_mode}) into the archive the same way the Gradle
+     * {@code CopyAction} does. Falls back to {@link #DEFAULT_DIR_MODE} / {@link #DEFAULT_FILE_MODE}
+     * on a non-POSIX filesystem (e.g. Windows), where the bits aren't available.
+     */
+    private static int unixMode(Path p, boolean dir) {
+        try {
+            int mode = 0;
+            for (PosixFilePermission perm : Files.getPosixFilePermissions(p)) {
+                mode |= switch (perm) {
+                    case OWNER_READ -> 0400; case OWNER_WRITE -> 0200; case OWNER_EXECUTE -> 0100;
+                    case GROUP_READ -> 0040; case GROUP_WRITE -> 0020; case GROUP_EXECUTE -> 0010;
+                    case OTHERS_READ -> 0004; case OTHERS_WRITE -> 0002; case OTHERS_EXECUTE -> 0001;
+                };
+            }
+            return mode;
+        } catch (UnsupportedOperationException | IOException e) {
+            return dir ? DEFAULT_DIR_MODE : DEFAULT_FILE_MODE;
+        }
+    }
+
     private static String normalizePrefix(String prefix) {
         if (prefix == null || prefix.isEmpty()) return "";
         String p = prefix.replace('\\', '/');
         if (!p.endsWith("/")) p = p + "/";
         if (p.startsWith("/")) p = p.substring(1);
         return p;
+    }
+
+    /**
+     * External file attributes for the central directory. The high 16 bits carry the Unix mode
+     * ({@code st_mode}); this normalizes the front-end's value so a UNIX-host archive (see
+     * {@link #MADE_BY_UNIX}) always extracts sanely on POSIX systems: a missing permission mode
+     * falls back to {@link #DEFAULT_FILE_MODE} / {@link #DEFAULT_DIR_MODE}, and the
+     * {@code S_IFREG} / {@code S_IFDIR} type bits are ORed in (matching Gradle's own {@code Zip},
+     * which sets {@code UnixStat.FILE_FLAG} / {@code DIR_FLAG}). The low 16 bits (MS-DOS attribute
+     * byte, e.g. the directory bit) are left untouched.
+     */
+    private static int externalAttrFor(Entry e) {
+        int dos = e.externalAttr & 0xFFFF;
+        int mode = (e.externalAttr >>> 16) & 07777;
+        if (mode == 0) mode = e.dir ? DEFAULT_DIR_MODE : DEFAULT_FILE_MODE;
+        mode |= e.dir ? S_IFDIR : S_IFREG;
+        return (mode << 16) | dos;
     }
 
     private static byte[] localHeader(Entry e, long crc, long compSize, long rawSize,
@@ -1007,7 +1061,7 @@ public final class ParallelZipWriter {
             int extraLen = z64 ? 4 + extraData : 0;
 
             b.putInt(CDH_SIG);
-            b.putShort((short) (z64 ? 45 : 20));   // version made by
+            b.putShort((short) (MADE_BY_UNIX | (z64 ? 45 : 20)));   // version made by: UNIX host
             b.putShort((short) (z64 ? 45 : 20));   // version needed
             b.putShort((short) FLAG_UTF8);
             b.putShort((short) method);
@@ -1021,7 +1075,7 @@ public final class ParallelZipWriter {
             b.putShort((short) 0);                 // comment length
             b.putShort((short) 0);                 // disk number start
             b.putShort((short) 0);                 // internal attrs
-            b.putInt(e.externalAttr);              // external attrs
+            b.putInt(externalAttrFor(e));          // external attrs (Unix st_mode in the high word)
             b.putInt((int) (z64off ? MAX32 : off));
             b.put(e.nameBytes);
             if (z64) {
@@ -1043,7 +1097,7 @@ public final class ParallelZipWriter {
             long eocd64Offset = cdOffset + cdSize;
             b.putInt(EOCD64_SIG);
             b.putLong(44);                         // size of remaining record
-            b.putShort((short) 45);                // version made by
+            b.putShort((short) (MADE_BY_UNIX | 45)); // version made by: UNIX host
             b.putShort((short) 45);                // version needed
             b.putInt(0);                           // this disk
             b.putInt(0);                           // disk with start of CD

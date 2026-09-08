@@ -81,6 +81,17 @@ produces byte-for-byte reproducible output for identical inputs (see [Reproducib
 and already separates `@Input` properties (`store`, `level`, `skipAlreadyCompressed` — affect the
 archive bytes) from `@Internal` ones (`threads` — doesn't).
 
+## File permissions
+
+Each entry's Unix mode is written into the high 16 bits of the central directory's
+"external file attributes", and the central directory advertises host system 3 (UNIX) in
+its "version made by" field — without that host byte, extractors read the archive as
+MS-DOS/FAT and ignore the mode bits entirely, so `unzip` on Linux/macOS would strip the
+executable bit off every file. The mode comes from Gradle's resolved `FileCopyDetails`
+(so `filePermissions`, `dirPermissions`, `eachFile { permissions { … } }` all apply);
+when a caller supplies no mode, entries default to `0644` for files and `0755` for
+directories. This matches Gradle's own `Zip` behaviour.
+
 ## Safety nets
 
 Per-entry: if DEFLATE would make an entry *larger* (already-compressed data, past what
