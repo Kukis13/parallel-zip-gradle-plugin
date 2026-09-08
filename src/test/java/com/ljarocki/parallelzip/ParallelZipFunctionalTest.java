@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.util.Comparator;
 import java.util.Enumeration;
@@ -23,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class ParallelZipFunctionalTest {
 
@@ -166,6 +168,60 @@ class ParallelZipFunctionalTest {
         String shaC = sha256(archive());
         assertEquals(shaA, shaB, "SHA must not depend on thread count");
         assertEquals(shaA, shaC, "SHA must not depend on thread count");
+    }
+
+    /**
+     * End-to-end permission round-trip: build the archive through the real Gradle task, then
+     * extract it with Info-ZIP {@code unzip} (the tool an end user on Linux/macOS actually
+     * reaches for) and assert the executable bit survived. Every other test here inspects
+     * archives via {@code java.util.zip.ZipFile}, which neither reports the "version made by"
+     * host byte nor restores Unix permissions -- which is exactly why the FAT-host bug went
+     * unnoticed until a user hit it. Skipped on Windows (no POSIX bits) and where {@code unzip}
+     * isn't on PATH.
+     */
+    @Test
+    void extractedFilesKeepUnixPermissions() throws Exception {
+        assumeTrue(!System.getProperty("os.name", "").toLowerCase().startsWith("win"),
+                "POSIX permissions are only meaningful on a POSIX filesystem");
+        assumeTrue(commandAvailable("unzip"), "Info-ZIP 'unzip' is not on PATH");
+
+        settings();
+        Path src = projectDir.resolve("staging");
+        Files.createDirectories(src.resolve("bin"));
+        Path script = src.resolve("bin/run.sh");
+        Files.writeString(script, "#!/bin/sh\necho hi\n");
+        Files.setPosixFilePermissions(script, PosixFilePermissions.fromString("rwxr-xr-x"));
+        Path plain = src.resolve("README.txt");
+        Files.writeString(plain, "hello\n");
+        Files.setPosixFilePermissions(plain, PosixFilePermissions.fromString("rw-r--r--"));
+
+        buildFile("    from 'staging'\n");
+        run("dist");
+
+        Path outDir = projectDir.resolve("extracted");
+        Files.createDirectories(outDir);
+        Process p = new ProcessBuilder("unzip", "-q", archive().toString(), "-d", outDir.toString())
+                .redirectErrorStream(true).start();
+        assertEquals(0, p.waitFor(), "unzip should extract the archive cleanly");
+
+        String scriptMode = PosixFilePermissions.toString(
+                Files.getPosixFilePermissions(outDir.resolve("bin/run.sh")));
+        assertEquals("rwxr-xr-x", scriptMode,
+                "executable bit and mode must survive the zip/unzip round-trip (got " + scriptMode + ")");
+        assertFalse(Files.isExecutable(outDir.resolve("README.txt")),
+                "a non-executable source file must not come out executable");
+    }
+
+    private static boolean commandAvailable(String cmd) {
+        try {
+            new ProcessBuilder(cmd, "-v").redirectErrorStream(true).start().waitFor();
+            return true; // it ran (exit code varies by build); absence throws IOException instead
+        } catch (IOException notFound) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     @Test
