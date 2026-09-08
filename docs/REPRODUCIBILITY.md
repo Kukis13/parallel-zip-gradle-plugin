@@ -12,10 +12,15 @@ elsewhere fall back to the JDK `Deflater`, so byte-identical output across *diff
 platforms* also requires both sides to have (or both lack) the native accelerator —
 same-platform reproducibility is unaffected either way.
 
+With `preserveFileTimestamps = true` (the default), entry timestamps are derived in the local
+time zone but independently of the JVM's default *locale* — a build on a machine set to a
+Thai or Japanese-imperial locale produces the same DOS dates as anywhere else (fixed in
+1.4.3; earlier versions read a non-Gregorian year and wrote corrupt dates).
+
 Output bytes are stable across runs on a given plugin version, but not necessarily *across*
 versions when the archive format itself changes: 1.4.2 records Unix file permissions and a
 UNIX host in the central directory (1.4.1 and earlier did not — see
-[How it works](ARCHITECTURE.md#file-permissions)), so a 1.4.2 archive is not byte-identical
+[How it works](ARCHITECTURE.md#file-permissions)), so a 1.4.2+ archive is not byte-identical
 to a 1.4.1 one built from the same inputs.
 
 See also: [How it works](ARCHITECTURE.md) · [Benchmarks](BENCHMARKS.md) ·

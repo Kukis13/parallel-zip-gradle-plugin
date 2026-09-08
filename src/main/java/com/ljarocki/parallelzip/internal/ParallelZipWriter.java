@@ -17,6 +17,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -1126,13 +1129,25 @@ public final class ParallelZipWriter {
         return out;
     }
 
+    /**
+     * Converts an epoch-milli instant to a {@code {dosTime, dosDate}} pair in the JVM's local
+     * time zone -- MS-DOS timestamps carry no zone, the same convention {@link java.util.zip.ZipEntry}
+     * uses.
+     *
+     * <p>Deliberately uses {@link LocalDateTime}, not {@link java.util.Calendar}:
+     * {@code Calendar.getInstance()} follows the default <em>locale's</em> calendar system, so on a
+     * Thai ({@code th}) locale it returns a Buddhist calendar (year = Gregorian + 543) and on a
+     * Japanese-imperial locale an era year -- either way {@code get(YEAR)} is not the Gregorian year,
+     * and the {@code (year - 1980)} arithmetic below then silently produces a corrupt DOS date. The
+     * DOS date field only spans 1980-2107, so instants outside that range fall back to the fixed
+     * 1980-01-01 stamp rather than overflowing.</p>
+     */
     public static int[] dosDateTime(long millis) {
-        java.util.Calendar c = java.util.Calendar.getInstance();
-        c.setTimeInMillis(millis);
-        int year = c.get(java.util.Calendar.YEAR);
-        if (year < 1980) return new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
-        int date = ((year - 1980) << 9) | ((c.get(java.util.Calendar.MONTH) + 1) << 5) | c.get(java.util.Calendar.DAY_OF_MONTH);
-        int time = (c.get(java.util.Calendar.HOUR_OF_DAY) << 11) | (c.get(java.util.Calendar.MINUTE) << 5) | (c.get(java.util.Calendar.SECOND) >> 1);
+        LocalDateTime t = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault());
+        int year = t.getYear();
+        if (year < 1980 || year > 2107) return new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
+        int date = ((year - 1980) << 9) | (t.getMonthValue() << 5) | t.getDayOfMonth();
+        int time = (t.getHour() << 11) | (t.getMinute() << 5) | (t.getSecond() >> 1);
         return new int[]{time, date};
     }
 
