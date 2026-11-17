@@ -13,14 +13,18 @@ import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -33,6 +37,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 
@@ -108,6 +113,7 @@ public final class ParallelZipWriter {
      */
     static final long MMAP_THRESHOLD = 128L << 20; // 128 MiB
     static final int STREAM_BUF = 1 << 16;
+    static final int IO_BUF = 256 * 1024;
 
     // Fixed DOS date/time used when timestamps are not preserved: 1980-01-01 00:00:00.
     public static final int FIXED_DOS_TIME = 0;
@@ -263,7 +269,7 @@ public final class ParallelZipWriter {
         private final boolean skipAlreadyCompressed;
         private final int level;
         private final long spillThreshold;
-        private final Path spillDir;
+        private final Supplier<Path> spillDir;
         private final long startNanos;
 
         private final long[] stats = new long[2];   // raw, stored
@@ -289,6 +295,11 @@ public final class ParallelZipWriter {
 
         public Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                     boolean forceZip64, long spillThreshold, Path spillDir) {
+            this(out, store, skipAlreadyCompressed, level, threads, forceZip64, spillThreshold, () -> spillDir);
+        }
+
+        Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
+             boolean forceZip64, long spillThreshold, Supplier<Path> spillDir) {
             this.store = store;
             this.skipAlreadyCompressed = skipAlreadyCompressed;
             this.level = level;
@@ -422,7 +433,10 @@ public final class ParallelZipWriter {
             List<long[]> meta = new ArrayList<>();
             boolean failed = false;
             long offset = 0;
-            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out), 1 << 20)) {
+            ByteBuffer lhScratch = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
+            try (FileChannel outCh = FileChannel.open(out,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+                 ChannelWriter cw = new ChannelWriter(outCh, 1 << 20)) {
                 while (true) {
                     Item item = queue.take();
                     if (item == POISON_ITEM) break;
@@ -438,10 +452,10 @@ public final class ParallelZipWriter {
                     if (failed || results == null) continue;   // keep draining the queue
                     for (Compressed c : results) {
                         long localOffset = offset;
-                        byte[] lh = localHeader(c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
-                        os.write(lh);
-                        writePayload(os, c);
-                        offset += lh.length + c.compSize;
+                        lhScratch = writeLocalHeader(cw, lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
+                        int lhLen = lhScratch.remaining();
+                        writePayload(cw, c);
+                        offset += lhLen + c.compSize;
                         order.add(c.e);
                         meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
                         stats[0] += c.rawSize; stats[1] += c.compSize;
@@ -449,7 +463,8 @@ public final class ParallelZipWriter {
                 }
                 if (!failed) {
                     byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
-                    os.write(tail);
+                    cw.write(tail, 0, tail.length);
+                    cw.flush();
                     archiveSize = offset + tail.length;
                     entryCount = order.size();
                 }
@@ -479,20 +494,82 @@ public final class ParallelZipWriter {
         }
     }
 
-    private static void writePayload(OutputStream os, Compressed c) throws IOException {
+    private static final class ChannelWriter implements AutoCloseable {
+        private final FileChannel ch;
+        private final byte[] buf;
+        private final ByteBuffer bb;
+        private int pos;
+
+        ChannelWriter(FileChannel ch, int cap) {
+            this.ch = ch;
+            this.buf = new byte[cap];
+            this.bb = ByteBuffer.wrap(buf);
+        }
+
+        void write(byte[] src, int off, int len) throws IOException {
+            if (len == 0) return;
+            if (len <= buf.length - pos) {
+                System.arraycopy(src, off, buf, pos, len);
+                pos += len;
+                return;
+            }
+            flush();
+            if (len >= buf.length) {
+                ByteBuffer direct = ByteBuffer.wrap(src, off, len);
+                while (direct.hasRemaining()) ch.write(direct);
+            } else {
+                System.arraycopy(src, off, buf, 0, len);
+                pos = len;
+            }
+        }
+
+        void flush() throws IOException {
+            if (pos == 0) return;
+            bb.position(0).limit(pos);
+            while (bb.hasRemaining()) ch.write(bb);
+            pos = 0;
+        }
+
+        void transferFrom(Path src, long count, String entryName) throws IOException {
+            flush();
+            try (FileChannel in = FileChannel.open(src, StandardOpenOption.READ)) {
+                long p = 0;
+                long rem = count;
+                while (rem > 0) {
+                    long n = in.transferTo(p, rem, ch);
+                    if (n <= 0) {
+                        if (p >= in.size()) throw new IOException("Unexpected EOF streaming " + entryName);
+                        // Fallback if transferTo returns 0 on a non-EOF position
+                        bb.clear();
+                        int max = (int) Math.min(buf.length, rem);
+                        bb.limit(max);
+                        int r = in.read(bb, p);
+                        if (r < 0) throw new IOException("Unexpected EOF streaming " + entryName);
+                        bb.flip();
+                        while (bb.hasRemaining()) ch.write(bb);
+                        p += r;
+                        rem -= r;
+                    } else {
+                        p += n;
+                        rem -= n;
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            flush();
+        }
+    }
+
+    private static void writePayload(ChannelWriter cw, Compressed c) throws IOException {
         if (c.data != null) {
-            os.write(c.data, 0, (int) c.compSize);
+            cw.write(c.data, 0, (int) c.compSize);
             return;
         }
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(c.streamFrom), 1 << 20)) {
-            byte[] buf = new byte[STREAM_BUF];
-            long remaining = c.compSize;
-            while (remaining > 0) {
-                int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
-                if (n < 0) throw new IOException("Unexpected EOF streaming " + c.e.name);
-                os.write(buf, 0, n);
-                remaining -= n;
-            }
+        try {
+            cw.transferFrom(c.streamFrom, c.compSize, c.e.name);
         } finally {
             if (c.streamIsTemp) Files.deleteIfExists(c.streamFrom);
         }
@@ -509,7 +586,7 @@ public final class ParallelZipWriter {
      */
     private static List<Compressed> compressBatch(List<Entry> batch, boolean store, boolean skipAlreadyCompressed,
                                                   int level, Deflater def, long nativeHandle, long spillThreshold,
-                                                  Path spillDir, long mmapThreshold) {
+                                                  Supplier<Path> spillDir, long mmapThreshold) {
         if (!store && nativeHandle != 0 && batch.size() > 1) {
             return compressBatchNative(batch, def, nativeHandle, skipAlreadyCompressed);
         }
@@ -537,7 +614,9 @@ public final class ParallelZipWriter {
         int n = batch.size();
         Compressed[] result = new Compressed[n];
         byte[][] rawByIndex = new byte[n][];
-        List<Integer> nativeIdx = new ArrayList<>(n);
+        int[] nativeIdx = new int[n];
+        int nativeCount = 0;
+        CRC32 crc = null;
 
         for (int i = 0; i < n; i++) {
             Entry e = batch.get(i);
@@ -546,20 +625,20 @@ public final class ParallelZipWriter {
             if (raw.length == 0) {
                 result[i] = new Compressed(e, raw, null, false, 0L, 0, 0, 0); // CRC-32 of empty input is 0
             } else if (skipAlreadyCompressed && looksAlreadyCompressed(raw, raw.length)) {
-                CRC32 crc = new CRC32();
+                if (crc == null) crc = new CRC32(); else crc.reset();
                 crc.update(raw);
                 result[i] = new Compressed(e, raw, null, false, crc.getValue(), raw.length, raw.length, 0);
             } else {
-                nativeIdx.add(i);
+                nativeIdx[nativeCount++] = i;
             }
         }
 
-        if (!nativeIdx.isEmpty()) {
-            int m = nativeIdx.size();
+        if (nativeCount > 0) {
+            int m = nativeCount;
             byte[][] raws = new byte[m][];
             byte[][] outs = new byte[m][];
             for (int k = 0; k < m; k++) {
-                byte[] raw = rawByIndex[nativeIdx.get(k)];
+                byte[] raw = rawByIndex[nativeIdx[k]];
                 raws[k] = raw;
                 // A distinct (not aliased) array: passing the same array object as both input
                 // and output would pin it twice under GetPrimitiveArrayCritical in the native
@@ -575,7 +654,7 @@ public final class ParallelZipWriter {
             LibdeflateNative.compressBatch(nativeHandle, raws, outs, outLens, crcs, m);
 
             for (int k = 0; k < m; k++) {
-                int i = nativeIdx.get(k);
+                int i = nativeIdx[k];
                 Entry e = batch.get(i);
                 byte[] raw = raws[k];
                 if (outLens[k] == LibdeflateNative.STORE_SENTINEL || outLens[k] >= raw.length) {
@@ -589,7 +668,7 @@ public final class ParallelZipWriter {
                 }
             }
         }
-        return List.of(result);
+        return Arrays.asList(result);
     }
 
     private static byte[] readSmallEntry(Entry e) {
@@ -601,7 +680,7 @@ public final class ParallelZipWriter {
     }
 
     private static Compressed compress(Entry e, boolean store, boolean skipAlreadyCompressed, int level,
-                                       Deflater def, long nativeHandle, long spillThreshold, Path spillDir,
+                                       Deflater def, long nativeHandle, long spillThreshold, Supplier<Path> spillDir,
                                        long mmapThreshold) {
         try {
             if (e.dir) return new Compressed(e, new byte[0], null, false, 0, 0, 0, 0);
@@ -609,7 +688,7 @@ public final class ParallelZipWriter {
                 return compressBytes(e, e.inline, store, skipAlreadyCompressed, def, nativeHandle);
             }
             if (e.size > spillThreshold) {
-                return compressLarge(e, store, skipAlreadyCompressed, level, spillDir, nativeHandle, mmapThreshold);
+                return compressLarge(e, store, skipAlreadyCompressed, def, spillDir, nativeHandle, mmapThreshold);
             }
             return compressBytes(e, Files.readAllBytes(e.file), store, skipAlreadyCompressed, def, nativeHandle);
         } catch (IOException ex) {
@@ -724,23 +803,30 @@ public final class ParallelZipWriter {
     static final int SNIFF_KEEP_PCT = 98; // store when the probe compresses to >= this % of its size
 
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
-    private static Compressed compressLarge(Entry e, boolean store, boolean skipAlreadyCompressed, int level,
-                                            Path spillDir, long nativeHandle, long mmapThreshold) throws IOException {
-        if (store || (skipAlreadyCompressed && looksAlreadyCompressed(e.file))
-                || looksIncompressible(e.file, e.size, level)) {
+    private static Compressed compressLarge(Entry e, boolean store, boolean skipAlreadyCompressed, Deflater def,
+                                            Supplier<Path> spillDir, long nativeHandle, long mmapThreshold) throws IOException {
+        if (store || (skipAlreadyCompressed && looksAlreadyCompressed(e.file))) {
             CRC32 crc = new CRC32();
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
         if (nativeHandle != 0 && e.size <= mmapThreshold) {
+            // Skip Java-side looksIncompressible here: tryMmapNativeDeflate runs the exact same
+            // 64 KiB sniff natively in pzip_compress_or_store without opening the file again or
+            // allocating a JDK Deflater.
             Compressed viaMmap = tryMmapNativeDeflate(e, nativeHandle);
             if (viaMmap != null) return viaMmap;
             // fell through: mmap or the native call failed for some reason, stream via the
             // JDK Deflater below instead -- same fallback contract as tryNativeDeflate.
         }
+        if (looksIncompressible(e.file, e.size, def)) {
+            CRC32 crc = new CRC32();
+            crcOf(e.file, crc);
+            return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
+        }
         CRC32 crc = new CRC32();
-        Path tmp = Files.createTempFile(spillDir, "e", ".z");
-        long compSize = deflateToFile(e.file, tmp, level, crc);
+        Path tmp = Files.createTempFile(spillDir.get(), "e", ".z");
+        long compSize = deflateToFile(e.file, tmp, def, crc);
         if (compSize >= e.size) { // deflate didn't help: stream the input as STORE
             Files.deleteIfExists(tmp);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
@@ -817,52 +903,61 @@ public final class ParallelZipWriter {
      * container format whose leading entry is small or stored (e.g. a jar's
      * {@code META-INF/MANIFEST.MF}), so a signature match here skips both the probe and the
      * compression attempt outright rather than risk paying full compression cost anyway.
-     */
-    private static final byte[][] COMPRESSED_MAGICS = {
-        {0x50, 0x4B, 0x03, 0x04},                                     // ZIP family: jar/war/ear/apk/aar/
-        {0x50, 0x4B, 0x05, 0x06},                                     // whl/nupkg/docx/xlsx/pptx/odt/zip
-        {0x50, 0x4B, 0x07, 0x08},                                     // (empty / spanned ZIP variants)
-        {0x1F, (byte) 0x8B},                                          // gzip (.gz, .tgz, .tar.gz)
-        {0x42, 0x5A, 0x68},                                           // bzip2
-        {(byte) 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00},                  // xz
-        {0x37, 0x7A, (byte) 0xBC, (byte) 0xAF, 0x27, 0x1C},           // 7-zip
-        {(byte) 0x28, (byte) 0xB5, 0x2F, (byte) 0xFD},                // zstd
-        {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00},                   // rar 1.5-4.x
-        {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00},             // rar 5.0
-        {0x04, 0x22, 0x4D, 0x18},                                     // lz4 frame
-        {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},      // png
-        {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF},                      // jpeg
-        {0x47, 0x49, 0x46, 0x38},                                     // gif87a / gif89a
-        {0x1A, 0x45, (byte) 0xDF, (byte) 0xA3},                       // webm/mkv (EBML)
-        {0x4F, 0x67, 0x67, 0x53},                                     // ogg
-        {0x77, 0x4F, 0x46, 0x46},                                     // woff
-        {0x77, 0x4F, 0x46, 0x32},                                     // woff2
-    };
-
-    /**
-     * Cheap, exact alternative to the statistical {@link #looksIncompressible} sniff: matches
-     * {@code header} against {@link #COMPRESSED_MAGICS}, plus two signatures that aren't at
-     * offset 0 (WebP's {@code WEBP} at byte 8, inside a RIFF container; ISO-BMFF's {@code ftyp}
-     * at byte 4, covering mp4/mov/m4a). {@code len} is the number of valid bytes actually read
-     * into {@code header} (may be shorter than {@code header.length} for a small entry).
+     *
+     * <p>Cheap, exact alternative to the statistical {@link #looksIncompressible} sniff: matches
+     * {@code header} against ZIP/jar/war/ear/apk/aar/whl/nupkg/docx/xlsx/pptx/odt, gzip, bzip2,
+     * xz, 7-zip, zstd, rar 1.5-5.0, lz4, png, jpeg, gif, webm/mkv, ogg, woff/woff2, WebP's
+     * {@code RIFF....WEBP}, and ISO-BMFF's {@code ftyp} at offset 4 (mp4/mov/m4a). {@code len}
+     * is the number of valid bytes actually read into {@code header}.</p>
      */
     private static boolean looksAlreadyCompressed(byte[] header, int len) {
-        outer:
-        for (byte[] magic : COMPRESSED_MAGICS) {
-            if (len < magic.length) continue;
-            for (int i = 0; i < magic.length; i++) {
-                if (header[i] != magic[i]) continue outer;
-            }
-            return true;
+        if (len < 2) return false;
+        switch (header[0]) {
+            case 0x50: // ZIP family: 50 4B (03 04 | 05 06 | 07 08)
+                return len >= 4 && header[1] == 0x4B
+                        && ((header[2] == 0x03 && header[3] == 0x04)
+                            || (header[2] == 0x05 && header[3] == 0x06)
+                            || (header[2] == 0x07 && header[3] == 0x08));
+            case 0x1F: // gzip
+                return header[1] == (byte) 0x8B;
+            case 0x42: // bzip2
+                return len >= 3 && header[1] == 0x5A && header[2] == 0x68;
+            case (byte) 0xFD: // xz
+                return len >= 6 && header[1] == 0x37 && header[2] == 0x7A
+                        && header[3] == 0x58 && header[4] == 0x5A && header[5] == 0x00;
+            case 0x37: // 7-zip
+                return len >= 6 && header[1] == 0x7A && header[2] == (byte) 0xBC
+                        && header[3] == (byte) 0xAF && header[4] == 0x27 && header[5] == 0x1C;
+            case 0x28: // zstd
+                return len >= 4 && header[1] == (byte) 0xB5 && header[2] == 0x2F && header[3] == (byte) 0xFD;
+            case 0x52: // rar 1.5-5.0 OR RIFF....WEBP
+                if (len >= 7 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21
+                        && header[4] == 0x1A && header[5] == 0x07
+                        && (header[6] == 0x00 || (len >= 8 && header[6] == 0x01 && header[7] == 0x00))) {
+                    return true;
+                }
+                return len >= 12 && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
+                        && header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P';
+            case 0x04: // lz4 frame
+                return len >= 4 && header[1] == 0x22 && header[2] == 0x4D && header[3] == 0x18;
+            case (byte) 0x89: // png
+                return len >= 8 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47
+                        && header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A;
+            case (byte) 0xFF: // jpeg
+                return len >= 3 && header[1] == (byte) 0xD8 && header[2] == (byte) 0xFF;
+            case 0x47: // gif87a / gif89a
+                return len >= 4 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x38;
+            case 0x1A: // webm/mkv (EBML)
+                return len >= 4 && header[1] == 0x45 && header[2] == (byte) 0xDF && header[3] == (byte) 0xA3;
+            case 0x4F: // ogg
+                return len >= 4 && header[1] == 0x67 && header[2] == 0x67 && header[3] == 0x53;
+            case 0x77: // woff / woff2
+                return len >= 4 && header[1] == 0x4F && header[2] == 0x46
+                        && (header[3] == 0x46 || header[3] == 0x32);
+            default:
+                break;
         }
-        if (len >= 12 && header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
-                && header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P') {
-            return true; // RIFF....WEBP
-        }
-        if (len >= 8 && header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') {
-            return true; // ISO-BMFF ftyp box: mp4/mov/m4a
-        }
-        return false;
+        return len >= 8 && header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p';
     }
 
     /** As {@link #looksAlreadyCompressed(byte[], int)}, reading just the header of a file-backed entry. */
@@ -882,7 +977,7 @@ public final class ParallelZipWriter {
      * below {@link #SNIFF_MIN_INPUT}, or where fewer than a full sample can be read, are never
      * judged incompressible (they just take the normal compress path).
      */
-    private static boolean looksIncompressible(Path file, long size, int level) throws IOException {
+    private static boolean looksIncompressible(Path file, long size, Deflater def) throws IOException {
         if (size < SNIFF_MIN_INPUT) return false;
         byte[] sample = new byte[SNIFF_SAMPLE];
         int got;
@@ -890,33 +985,29 @@ public final class ParallelZipWriter {
             got = in.readNBytes(sample, 0, sample.length);
         }
         if (got < SNIFF_SAMPLE) return false;
-        Deflater d = new Deflater(level, true);
-        try {
-            d.setInput(sample, 0, got);
-            d.finish();
-            byte[] tmp = new byte[STREAM_BUF];
-            long comp = 0;
-            while (!d.finished()) comp += d.deflate(tmp);
-            return comp * 100 >= (long) got * SNIFF_KEEP_PCT;
-        } finally {
-            d.end();
-        }
+        def.reset();
+        def.setInput(sample, 0, got);
+        def.finish();
+        byte[] tmp = new byte[STREAM_BUF];
+        long comp = 0;
+        while (!def.finished()) comp += def.deflate(tmp);
+        return comp * 100 >= (long) got * SNIFF_KEEP_PCT;
     }
 
     private static void crcOf(Path src, CRC32 crc) throws IOException {
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(src), 1 << 20)) {
-            byte[] buf = new byte[STREAM_BUF];
+        try (InputStream in = Files.newInputStream(src)) {
+            byte[] buf = new byte[IO_BUF];
             int n;
             while ((n = in.read(buf)) >= 0) if (n > 0) crc.update(buf, 0, n);
         }
     }
 
-    private static long deflateToFile(Path src, Path dst, int level, CRC32 crc) throws IOException {
-        Deflater def = new Deflater(level, true);
+    private static long deflateToFile(Path src, Path dst, Deflater def, CRC32 crc) throws IOException {
+        def.reset();
         long compSize = 0;
-        byte[] in = new byte[STREAM_BUF];
+        byte[] in = new byte[IO_BUF];
         byte[] out = new byte[STREAM_BUF];
-        try (InputStream is = new BufferedInputStream(Files.newInputStream(src), 1 << 20);
+        try (InputStream is = Files.newInputStream(src);
              OutputStream os = new BufferedOutputStream(Files.newOutputStream(dst), 1 << 20)) {
             int n;
             while ((n = is.read(in)) >= 0) {
@@ -933,8 +1024,6 @@ public final class ParallelZipWriter {
                 int c = def.deflate(out);
                 if (c > 0) { os.write(out, 0, c); compSize += c; }
             }
-        } finally {
-            def.end();
         }
         return compSize;
     }
@@ -946,23 +1035,41 @@ public final class ParallelZipWriter {
             String prefix = normalizePrefix(s.prefix());
             Path base = s.baseDir();
             if (!Files.exists(base)) continue;
-            try (var stream = Files.walk(base)) {
-                for (Path p : stream.toList()) {
-                    if (p.equals(base)) continue;
-                    boolean dir = Files.isDirectory(p);
+            Files.walkFileTree(base, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (!dir.equals(base)) {
+                        addPath(dir, true, attrs);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    addPath(file, false, attrs);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                private void addPath(Path p, boolean dir, BasicFileAttributes attrs) {
                     String rel = base.relativize(p).toString().replace('\\', '/');
-                    String name = prefix + rel;
-                    if (dir) name = name + "/";
-                    if (!seen.add(name)) continue; // first one wins on duplicates
-                    int[] dt = preserveTimestamps
-                            ? dosDateTime(Files.getLastModifiedTime(p).toMillis())
-                            : new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
+                    String name = dir ? (prefix + rel + "/") : (prefix + rel);
+                    if (!seen.add(name)) return; // first one wins on duplicates
+                    int dosTime;
+                    int dosDate;
+                    if (preserveTimestamps) {
+                        long packed = dosDateTimePacked(attrs.lastModifiedTime().toMillis());
+                        dosTime = (int) (packed >>> 32);
+                        dosDate = (int) packed;
+                    } else {
+                        dosTime = FIXED_DOS_TIME;
+                        dosDate = FIXED_DOS_DATE;
+                    }
                     int extAttr = (unixMode(p, dir) << 16) | (dir ? 0x10 : 0);
                     list.add(dir
-                            ? dirEntry(name, dt[0], dt[1], extAttr)
-                            : fileEntry(name, p, false, Files.size(p), dt[0], dt[1], extAttr));
+                            ? dirEntry(name, dosTime, dosDate, extAttr)
+                            : fileEntry(name, p, false, attrs.size(), dosTime, dosDate, extAttr));
                 }
-            }
+            });
         }
         list.sort(Comparator.comparing(e -> e.name));
         return list;
@@ -1015,11 +1122,16 @@ public final class ParallelZipWriter {
         return (mode << 16) | dos;
     }
 
-    private static byte[] localHeader(Entry e, long crc, long compSize, long rawSize,
-                                      int method, boolean force) {
+    private static ByteBuffer writeLocalHeader(ChannelWriter cw, ByteBuffer b, Entry e, long crc,
+                                               long compSize, long rawSize, int method, boolean force) throws IOException {
         boolean z64 = force || compSize >= MAX32 || rawSize >= MAX32;
         int extraLen = z64 ? 20 : 0; // id(2)+size(2)+uncompressed(8)+compressed(8)
-        ByteBuffer b = ByteBuffer.allocate(30 + e.nameBytes.length + extraLen).order(ByteOrder.LITTLE_ENDIAN);
+        int needed = 30 + e.nameBytes.length + extraLen;
+        if (b.capacity() < needed) {
+            b = ByteBuffer.allocate(needed).order(ByteOrder.LITTLE_ENDIAN);
+        } else {
+            b.clear();
+        }
         b.putInt(LFH_SIG);
         b.putShort((short) (z64 ? 45 : 20));       // version needed
         b.putShort((short) FLAG_UTF8);
@@ -1038,7 +1150,9 @@ public final class ParallelZipWriter {
             b.putLong(rawSize);                    // original size
             b.putLong(compSize);                   // compressed size
         }
-        return b.array();
+        b.flip();
+        cw.write(b.array(), 0, b.remaining());
+        return b;
     }
 
     /** Builds the central directory plus the (ZIP64) end-of-central-directory records. */
@@ -1142,13 +1256,20 @@ public final class ParallelZipWriter {
      * DOS date field only spans 1980-2107, so instants outside that range fall back to the fixed
      * 1980-01-01 stamp rather than overflowing.</p>
      */
-    public static int[] dosDateTime(long millis) {
+    public static long dosDateTimePacked(long millis) {
         LocalDateTime t = LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault());
         int year = t.getYear();
-        if (year < 1980 || year > 2107) return new int[]{FIXED_DOS_TIME, FIXED_DOS_DATE};
+        if (year < 1980 || year > 2107) {
+            return ((long) FIXED_DOS_TIME << 32) | (FIXED_DOS_DATE & 0xFFFFFFFFL);
+        }
         int date = ((year - 1980) << 9) | (t.getMonthValue() << 5) | t.getDayOfMonth();
         int time = (t.getHour() << 11) | (t.getMinute() << 5) | (t.getSecond() >> 1);
-        return new int[]{time, date};
+        return ((long) time << 32) | (date & 0xFFFFFFFFL);
+    }
+
+    public static int[] dosDateTime(long millis) {
+        long packed = dosDateTimePacked(millis);
+        return new int[]{(int) (packed >>> 32), (int) packed};
     }
 
     static void deleteRecursively(Path root) {

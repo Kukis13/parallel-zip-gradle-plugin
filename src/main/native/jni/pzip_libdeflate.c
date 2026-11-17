@@ -151,12 +151,13 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
     (void) clazz;
     struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
 
-    size_t n = (size_t) (count > 0 ? count : 1);
-    jint *lens = (jint *) malloc(sizeof(jint) * n);
-    jlong *crcs = (jlong *) malloc(sizeof(jlong) * n);
+    jint lens_stack[256];
+    jlong crcs_stack[256];
+    jint *lens = (count <= 256) ? lens_stack : (jint *) malloc(sizeof(jint) * (size_t) count);
+    jlong *crcs = (count <= 256) ? crcs_stack : (jlong *) malloc(sizeof(jlong) * (size_t) count);
     if (lens == NULL || crcs == NULL) {
-        free(lens);
-        free(crcs);
+        if (lens != lens_stack) free(lens);
+        if (crcs != crcs_stack) free(crcs);
         return; /* leaves outLensArr/crcsArr at their Java-side defaults (0), treated as failure by the caller */
     }
 
@@ -189,8 +190,8 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
 
     (*env)->SetIntArrayRegion(env, outLensArr, 0, count, lens);
     (*env)->SetLongArrayRegion(env, crcsArr, 0, count, crcs);
-    free(lens);
-    free(crcs);
+    if (lens != lens_stack) free(lens);
+    if (crcs != crcs_stack) free(crcs);
 }
 
 /*
