@@ -38,6 +38,9 @@ public class ParallelZipPlugin implements Plugin<Project> {
     @Override
     public void apply(Project project) {
         project.getExtensions().getExtraProperties().set("ParallelZip", ParallelZip.class);
+        project.getExtensions().getExtraProperties().set("ParallelJar", ParallelJar.class);
+        project.getExtensions().getExtraProperties().set("ParallelTar", ParallelTar.class);
+        project.getExtensions().getExtraProperties().set("ParallelTarGz", ParallelTarGz.class);
         ParallelZipExtension extension = project.getExtensions().create("parallelZip", ParallelZipExtension.class);
 
         Provider<Boolean> skip = extension.getSkipAlreadyCompressed();
@@ -46,6 +49,15 @@ public class ParallelZipPlugin implements Plugin<Project> {
 
         project.getTasks().withType(ParallelZip.class).configureEach(task -> {
             task.getSkipAlreadyCompressed().convention(skip);
+            task.getLevel().convention(level);
+            task.getThreads().convention(threads);
+        });
+        project.getTasks().withType(ParallelJar.class).configureEach(task -> {
+            task.getSkipAlreadyCompressed().convention(skip);
+            task.getLevel().convention(level);
+            task.getThreads().convention(threads);
+        });
+        project.getTasks().withType(ParallelTar.class).configureEach(task -> {
             task.getLevel().convention(level);
             task.getThreads().convention(threads);
         });

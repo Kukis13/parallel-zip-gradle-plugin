@@ -14,6 +14,8 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Bridges Gradle's copy pipeline to {@link ParallelZipWriter}. Gradle resolves the whole
@@ -42,9 +44,15 @@ public final class ParallelZipCopyAction implements CopyAction {
     private final int threads;
     private final boolean preserveTimestamps;
     private final long spillThreshold;
+    private final boolean pinManifestFirst;
 
     public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                                  boolean preserveTimestamps, long spillThreshold) {
+        this(archive, store, skipAlreadyCompressed, level, threads, preserveTimestamps, spillThreshold, false);
+    }
+
+    public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
+                                 boolean preserveTimestamps, long spillThreshold, boolean pinManifestFirst) {
         this.archive = archive;
         this.store = store;
         this.skipAlreadyCompressed = skipAlreadyCompressed;
@@ -52,6 +60,7 @@ public final class ParallelZipCopyAction implements CopyAction {
         this.threads = threads;
         this.preserveTimestamps = preserveTimestamps;
         this.spillThreshold = spillThreshold;
+        this.pinManifestFirst = pinManifestFirst;
     }
 
     @Override
@@ -65,21 +74,67 @@ public final class ParallelZipCopyAction implements CopyAction {
         try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
             ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
                     archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir);
-            stream.process(details -> {
-                try {
-                    sink.add(toEntry(details, spillDir));
-                } catch (IOException ex) {
-                    throw new UncheckedIOException(ex);
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException(ex);
+            if (!pinManifestFirst) {
+                stream.process(details -> addEntry(sink, toEntrySafe(details, spillDir)));
+            } else {
+                List<ParallelZipWriter.Entry> deferred = new ArrayList<>();
+                final ParallelZipWriter.Entry[] metaInfDir = new ParallelZipWriter.Entry[1];
+                final boolean[] manifestFlushed = new boolean[1];
+                stream.process(details -> {
+                    ParallelZipWriter.Entry entry = toEntrySafe(details, spillDir);
+                    if (manifestFlushed[0]) {
+                        addEntry(sink, entry);
+                        return;
+                    }
+                    if ("META-INF".equals(entry.name) || "META-INF/".equals(entry.name)) {
+                        metaInfDir[0] = entry;
+                    } else if ("META-INF/MANIFEST.MF".equals(entry.name)) {
+                        if (metaInfDir[0] != null) {
+                            addEntry(sink, metaInfDir[0]);
+                            metaInfDir[0] = null;
+                        }
+                        addEntry(sink, entry);
+                        for (ParallelZipWriter.Entry d : deferred) {
+                            addEntry(sink, d);
+                        }
+                        deferred.clear();
+                        manifestFlushed[0] = true;
+                    } else {
+                        deferred.add(entry);
+                    }
+                });
+                if (!manifestFlushed[0]) {
+                    if (metaInfDir[0] != null) {
+                        addEntry(sink, metaInfDir[0]);
+                    }
+                    for (ParallelZipWriter.Entry d : deferred) {
+                        addEntry(sink, d);
+                    }
                 }
-            });
+            }
             sink.finish();
             return WorkResults.didWork(true);
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new RuntimeException("parallel-zip archive failed", ex);
+        }
+    }
+
+    private ParallelZipWriter.Entry toEntrySafe(FileCopyDetailsInternal details,
+                                                java.util.function.Supplier<Path> spillDir) {
+        try {
+            return toEntry(details, spillDir);
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+    }
+
+    private static void addEntry(ParallelZipWriter.Sink sink, ParallelZipWriter.Entry entry) {
+        try {
+            sink.add(entry);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(ex);
         }
     }
 
