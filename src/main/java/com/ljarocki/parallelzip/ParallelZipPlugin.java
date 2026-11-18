@@ -1,6 +1,7 @@
 package com.ljarocki.parallelzip;
 
 import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
+import com.ljarocki.parallelzip.internal.ParallelZipFastPath;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.Action;
 import org.gradle.api.Plugin;
@@ -117,6 +118,11 @@ public class ParallelZipPlugin implements Plugin<Project> {
             int lvl = level.get();
             int threadCount = Math.max(1, threads.get());
             boolean preserveTimestamps = zip.isPreserveFileTimestamps();
+
+            if (ParallelZipFastPath.tryExecute(zip, store, skip, lvl, threadCount)) {
+                zip.setDidWork(true);
+                return;
+            }
 
             ParallelZipCopyAction copyAction = new ParallelZipCopyAction(
                     out,

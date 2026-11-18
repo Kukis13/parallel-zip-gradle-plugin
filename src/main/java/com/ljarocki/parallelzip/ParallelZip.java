@@ -1,6 +1,7 @@
 package com.ljarocki.parallelzip;
 
 import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
+import com.ljarocki.parallelzip.internal.ParallelZipFastPath;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.provider.Property;
@@ -89,6 +90,20 @@ public abstract class ParallelZip extends AbstractArchiveTask {
         getArchiveExtension().convention("zip");
         getDestinationDirectory().convention(getProject().getLayout().getBuildDirectory().dir("distributions"));
         getArchiveBaseName().convention(getProject().getName());
+    }
+
+    @Override
+    protected void copy() {
+        if (ParallelZipFastPath.tryExecute(
+                this,
+                getStore().get(),
+                getSkipAlreadyCompressed().get(),
+                getLevel().get(),
+                Math.max(1, getThreads().get()))) {
+            setDidWork(true);
+            return;
+        }
+        super.copy();
     }
 
     @Override
