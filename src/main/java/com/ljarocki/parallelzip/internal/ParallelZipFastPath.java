@@ -178,10 +178,29 @@ public final class ParallelZipFastPath {
         if (!resolver.getAllIncludeSpecs().isEmpty()) return false;
         if (!resolver.getAllExcludeSpecs().isEmpty()) return false;
         if (!resolver.getIncludeEmptyDirs()) return false;
-        if (resolver.getFileMode() != null || resolver.getDirMode() != null) return false;
+        if (hasLegacyModeOverride(resolver)) return false;
         if (resolver.getImmutableFilePermissions().isPresent()) return false;
         if (resolver.getImmutableDirPermissions().isPresent()) return false;
         return true;
+    }
+
+    private static final java.lang.reflect.Method LEGACY_GET_FILE_MODE = findMethod("getFileMode");
+    private static final java.lang.reflect.Method LEGACY_GET_DIR_MODE = findMethod("getDirMode");
+
+    private static java.lang.reflect.Method findMethod(String name) {
+        try {
+            return CopySpecResolver.class.getMethod(name);
+        } catch (NoSuchMethodException e) {
+            return null; // Removed in Gradle 9+
+        }
+    }
+
+    private static boolean hasLegacyModeOverride(CopySpecResolver resolver) {
+        try {
+            if (LEGACY_GET_FILE_MODE != null && LEGACY_GET_FILE_MODE.invoke(resolver) != null) return true;
+            if (LEGACY_GET_DIR_MODE != null && LEGACY_GET_DIR_MODE.invoke(resolver) != null) return true;
+        } catch (ReflectiveOperationException ignored) { }
+        return false;
     }
 
     private static List<ParallelZipWriter.Entry> collectEntries(List<DirSource> dirSources,
