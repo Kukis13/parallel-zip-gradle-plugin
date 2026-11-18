@@ -184,6 +184,31 @@ class LibdeflateNativeTest {
         }
     }
 
+    @Test
+    void sniffIncompressibleDirectDetectsIncompressibleAndComputesCrc() {
+        assumeTrue(LibdeflateNative.available(), "native libdeflate not available on this platform/build");
+        long handle = alloc(6);
+        try {
+            byte[] randomBytes = new byte[500_000];
+            new Random(123).nextBytes(randomBytes);
+            java.nio.ByteBuffer directIncomp = java.nio.ByteBuffer.allocateDirect(randomBytes.length);
+            directIncomp.put(randomBytes).flip();
+            long[] crcOut = new long[1];
+            assertTrue(LibdeflateNative.sniffIncompressibleDirect(handle, directIncomp, randomBytes.length, crcOut),
+                    "incompressible direct buffer must be flagged for STORE without allocating an output byte[]");
+            assertEquals(expectedCrc(randomBytes), crcOut[0], "CRC-32 must be populated when sniff returns true");
+
+            byte[] compBytes = "The quick brown fox jumps over the lazy dog. ".repeat(10_000)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            java.nio.ByteBuffer directComp = java.nio.ByteBuffer.allocateDirect(compBytes.length);
+            directComp.put(compBytes).flip();
+            assertEquals(false, LibdeflateNative.sniffIncompressibleDirect(handle, directComp, compBytes.length, crcOut),
+                    "compressible direct buffer must not be flagged as incompressible");
+        } finally {
+            LibdeflateNative.freeCompressor(handle);
+        }
+    }
+
     private static long alloc(int level) {
         long handle = LibdeflateNative.allocCompressor(level);
         assertTrue(handle != 0, "compressor allocation must succeed");

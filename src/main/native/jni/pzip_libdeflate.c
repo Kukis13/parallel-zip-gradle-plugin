@@ -149,14 +149,18 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
         jlong handle, jobjectArray ins, jobjectArray outs, jintArray outLensArr,
         jlongArray crcsArr, jint count) {
     (void) clazz;
+    if (count <= 0) {
+        return;
+    }
     struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
 
-    size_t n = (size_t) (count > 0 ? count : 1);
-    jint *lens = (jint *) malloc(sizeof(jint) * n);
-    jlong *crcs = (jlong *) malloc(sizeof(jlong) * n);
+    jint lens_stack[256];
+    jlong crcs_stack[256];
+    jint *lens = (count <= 256) ? lens_stack : (jint *) malloc(sizeof(jint) * (size_t) count);
+    jlong *crcs = (count <= 256) ? crcs_stack : (jlong *) malloc(sizeof(jlong) * (size_t) count);
     if (lens == NULL || crcs == NULL) {
-        free(lens);
-        free(crcs);
+        if (lens != lens_stack) free(lens);
+        if (crcs != crcs_stack) free(crcs);
         return; /* leaves outLensArr/crcsArr at their Java-side defaults (0), treated as failure by the caller */
     }
 
@@ -189,8 +193,8 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
 
     (*env)->SetIntArrayRegion(env, outLensArr, 0, count, lens);
     (*env)->SetLongArrayRegion(env, crcsArr, 0, count, crcs);
-    free(lens);
-    free(crcs);
+    if (lens != lens_stack) free(lens);
+    if (crcs != crcs_stack) free(crcs);
 }
 
 /*
@@ -231,4 +235,33 @@ JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
 
     pzip_set_crc_out(env, crcOut, crc);
     return rc;
+}
+
+/*
+ * Probes the first PZIP_SNIFF_SAMPLE bytes of a direct ByteBuffer using a stack
+ * scratch buffer, before the Java caller allocates a multi-MiB output byte[].
+ * If the probe indicates the input is incompressible, computes the full-buffer
+ * CRC-32 into crcOut[0] and returns JNI_TRUE so the caller can STORE the entry
+ * with zero Java heap allocation.
+ */
+JNIEXPORT jboolean JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_sniffIncompressibleDirect(
+        JNIEnv *env, jclass clazz,
+        jlong handle, jobject inBuf, jint inLen, jlongArray crcOut) {
+    (void) clazz;
+    struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
+    if (c == NULL || (size_t) inLen < PZIP_SNIFF_MIN_INPUT) {
+        return JNI_FALSE;
+    }
+    const void *inp = (*env)->GetDirectBufferAddress(env, inBuf);
+    if (inp == NULL) {
+        return JNI_FALSE;
+    }
+    uint8_t probe_buf[PZIP_SNIFF_SAMPLE];
+    size_t probe = libdeflate_deflate_compress(c, inp, PZIP_SNIFF_SAMPLE, probe_buf, sizeof(probe_buf));
+    if (probe == 0 || probe * 100u >= (size_t) PZIP_SNIFF_SAMPLE * PZIP_SNIFF_KEEP_PCT) {
+        uint32_t crc = libdeflate_crc32(0, inp, (size_t) inLen);
+        pzip_set_crc_out(env, crcOut, crc);
+        return JNI_TRUE;
+    }
+    return JNI_FALSE;
 }

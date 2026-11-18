@@ -56,13 +56,13 @@ public final class ParallelZipCopyAction implements CopyAction {
 
     @Override
     public WorkResult execute(CopyActionProcessingStream stream) {
-        final Path spillDir;
+        final Path spillParent;
         try {
-            spillDir = Files.createTempDirectory(ParallelZipWriter.prepareParent(archive), ".pzip-");
+            spillParent = ParallelZipWriter.prepareParent(archive);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-        try {
+        try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
             ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
                     archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir);
             stream.process(details -> {
@@ -80,29 +80,35 @@ public final class ParallelZipCopyAction implements CopyAction {
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new RuntimeException("parallel-zip archive failed", ex);
-        } finally {
-            ParallelZipWriter.deleteRecursively(spillDir);
         }
     }
 
-    private ParallelZipWriter.Entry toEntry(FileCopyDetailsInternal details, Path spillDir) throws IOException {
+    private ParallelZipWriter.Entry toEntry(FileCopyDetailsInternal details,
+                                            java.util.function.Supplier<Path> spillDir) throws IOException {
         String name = details.getRelativePath().getPathString();
-        int[] dt = preserveTimestamps
-                ? ParallelZipWriter.dosDateTime(details.getLastModified())
-                : new int[]{ParallelZipWriter.FIXED_DOS_TIME, ParallelZipWriter.FIXED_DOS_DATE};
+        int dosTime;
+        int dosDate;
+        if (preserveTimestamps) {
+            long packed = ParallelZipWriter.dosDateTimePacked(details.getLastModified());
+            dosTime = (int) (packed >>> 32);
+            dosDate = (int) packed;
+        } else {
+            dosTime = ParallelZipWriter.FIXED_DOS_TIME;
+            dosDate = ParallelZipWriter.FIXED_DOS_DATE;
+        }
         boolean dir = details.isDirectory();
         int extAttr = externalAttr(details, dir);
         if (dir) {
-            return ParallelZipWriter.dirEntry(name, dt[0], dt[1], extAttr);
+            return ParallelZipWriter.dirEntry(name, dosTime, dosDate, extAttr);
         }
         Path real = rawFileOrNull(details);
         if (real != null) {
             // No filter: defer the read to compress time, on a worker thread, instead of
             // reading it here on Gradle's single-threaded copy walk.
-            return ParallelZipWriter.fileEntry(name, real, false, Files.size(real), dt[0], dt[1], extAttr);
+            return ParallelZipWriter.fileEntry(name, real, false, details.getSize(), dosTime, dosDate, extAttr);
         }
         try (InputStream in = details.open()) {
-            return materialize(name, in, spillDir, dt[0], dt[1], extAttr);
+            return materialize(name, in, spillDir, dosTime, dosDate, extAttr);
         }
     }
 
@@ -116,7 +122,8 @@ public final class ParallelZipCopyAction implements CopyAction {
     }
 
     /** Reads content up to the spill threshold into memory; overflows the rest to a temp file. */
-    private ParallelZipWriter.Entry materialize(String name, InputStream in, Path spillDir,
+    private ParallelZipWriter.Entry materialize(String name, InputStream in,
+                                                java.util.function.Supplier<Path> spillDir,
                                                 int dosTime, int dosDate, int extAttr) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         byte[] chunk = new byte[64 * 1024];
@@ -128,7 +135,7 @@ public final class ParallelZipCopyAction implements CopyAction {
                 buf.write(chunk, 0, n);
                 total += n;
             } else {
-                Path tmp = Files.createTempFile(spillDir, "in", ".raw");
+                Path tmp = Files.createTempFile(spillDir.get(), "in", ".raw");
                 try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
                     buf.writeTo(os);
                     os.write(chunk, 0, n);
