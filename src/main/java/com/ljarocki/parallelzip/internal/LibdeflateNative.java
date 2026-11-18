@@ -106,6 +106,15 @@ public final class LibdeflateNative {
     public static native boolean sniffIncompressibleDirect(long handle, ByteBuffer in, int inLen,
                                                            long[] crcOut);
 
+    /**
+     * Opens, sniffs, CRCs, and compresses a batch of small/medium files directly in native code,
+     * avoiding per-file Java heap allocations. On any per-file error, {@code outLens[i]} is set
+     * to {@code -1} so the caller can fall back to the Java path.
+     */
+    public static native void compressFilesBatch(
+            long handle, String[] paths, byte[][] outs, int[] outLens, long[] rawSizes,
+            long[] crcs, int count, boolean store, boolean skipAlreadyCompressed);
+
     private static boolean load() {
         try {
             String resource = resourcePath();

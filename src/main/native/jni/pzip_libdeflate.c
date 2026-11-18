@@ -1,7 +1,9 @@
 #include <jni.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "libdeflate.h"
 
 /*
@@ -264,4 +266,146 @@ JNIEXPORT jboolean JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNati
         return JNI_TRUE;
     }
     return JNI_FALSE;
+}
+
+static int pzip_looks_already_compressed(const uint8_t *h, size_t len) {
+    if (len < 2) return 0;
+    switch (h[0]) {
+        case 0x50: /* ZIP / jar / docx */
+            return len >= 4 && h[1] == 0x4B && ((h[2] == 0x03 && h[3] == 0x04)
+                    || (h[2] == 0x05 && h[3] == 0x06) || (h[2] == 0x07 && h[3] == 0x08));
+        case 0x1F: /* gzip */
+            return h[1] == 0x8B;
+        case 0x42: /* bzip2 */
+            return len >= 3 && h[1] == 0x5A && h[2] == 0x68;
+        case 0xFD: /* xz */
+            return len >= 6 && h[1] == 0x37 && h[2] == 0x7A && h[3] == 0x58 && h[4] == 0x5A && h[5] == 0x00;
+        case 0x37: /* 7z */
+            return len >= 6 && h[1] == 0x7A && h[2] == 0xBC && h[3] == 0xAF && h[4] == 0x27 && h[5] == 0x1C;
+        case 0x28: /* zstd */
+            return len >= 4 && h[1] == 0xB5 && h[2] == 0x2F && h[3] == 0xFD;
+        case 0x89: /* png */
+            return len >= 4 && h[1] == 0x50 && h[2] == 0x4E && h[3] == 0x47;
+        case 0xFF: /* jpeg */
+            return len >= 3 && h[1] == 0xD8 && h[2] == 0xFF;
+        case 0x47: /* gif */
+            return len >= 4 && h[1] == 0x49 && h[2] == 0x46 && h[3] == 0x38;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Opens, sniffs, CRCs, and compresses a batch of small/medium files directly in native code,
+ * avoiding per-file Java byte[16] header arrays and InputStream wrappers on 20k-file corpora.
+ * On any per-file open/read/size-mismatch error, sets outLens[i] = -1 so Java falls back cleanly.
+ */
+JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compressFilesBatch(
+        JNIEnv *env, jclass clazz,
+        jlong handle,
+        jobjectArray paths,
+        jobjectArray outs,
+        jintArray outLensArr,
+        jlongArray rawSizesArr,
+        jlongArray crcsArr,
+        jint count,
+        jboolean store,
+        jboolean skipAlreadyCompressed) {
+    (void) clazz;
+    struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
+    jint *outLens = (*env)->GetIntArrayElements(env, outLensArr, NULL);
+    jlong *rawSizes = (*env)->GetLongArrayElements(env, rawSizesArr, NULL);
+    jlong *crcs = (*env)->GetLongArrayElements(env, crcsArr, NULL);
+    if (outLens == NULL || rawSizes == NULL || crcs == NULL) {
+        if (outLens) (*env)->ReleaseIntArrayElements(env, outLensArr, outLens, JNI_ABORT);
+        if (rawSizes) (*env)->ReleaseLongArrayElements(env, rawSizesArr, rawSizes, JNI_ABORT);
+        if (crcs) (*env)->ReleaseLongArrayElements(env, crcsArr, crcs, JNI_ABORT);
+        return;
+    }
+
+    size_t scratch_cap = 64u * 1024u;
+    uint8_t *scratch = (uint8_t *) malloc(scratch_cap);
+
+    for (jint i = 0; i < count; i++) {
+        outLens[i] = -1;
+        crcs[i] = 0;
+        jlong expected = rawSizes[i];
+        if (expected < 0 || expected > (64 * 1024 * 1024)) {
+            continue;
+        }
+        size_t need = (size_t) expected;
+        if (need > scratch_cap) {
+            uint8_t *grown = (uint8_t *) realloc(scratch, need);
+            if (grown == NULL) continue;
+            scratch = grown;
+            scratch_cap = need;
+        }
+
+        jstring jpath = (jstring) (*env)->GetObjectArrayElement(env, paths, i);
+        jbyteArray jout = (jbyteArray) (*env)->GetObjectArrayElement(env, outs, i);
+        if (jpath == NULL || jout == NULL) {
+            if (jpath) (*env)->DeleteLocalRef(env, jpath);
+            if (jout) (*env)->DeleteLocalRef(env, jout);
+            continue;
+        }
+
+        const char *cpath = (*env)->GetStringUTFChars(env, jpath, NULL);
+        FILE *fp = (cpath != NULL) ? fopen(cpath, "rb") : NULL;
+        if (cpath != NULL) (*env)->ReleaseStringUTFChars(env, jpath, cpath);
+        (*env)->DeleteLocalRef(env, jpath);
+
+        if (fp == NULL) {
+            (*env)->DeleteLocalRef(env, jout);
+            continue;
+        }
+
+        size_t total = 0;
+        while (total < need) {
+            size_t r = fread(scratch + total, 1, need - total, fp);
+            if (r == 0) break;
+            total += r;
+        }
+        int extra = fgetc(fp);
+        fclose(fp);
+
+        if (total != need || extra != EOF || scratch == NULL) {
+            (*env)->DeleteLocalRef(env, jout);
+            continue;
+        }
+
+        uint32_t crc = libdeflate_crc32(0, scratch, total);
+        crcs[i] = (jlong) crc;
+        jsize out_cap = (*env)->GetArrayLength(env, jout);
+
+        if (total == 0 || store || (skipAlreadyCompressed && pzip_looks_already_compressed(scratch, total))) {
+            if ((size_t) out_cap >= total) {
+                if (total > 0) {
+                    (*env)->SetByteArrayRegion(env, jout, 0, (jsize) total, (const jbyte *) scratch);
+                }
+                outLens[i] = PZIP_STORE_SENTINEL;
+            }
+            (*env)->DeleteLocalRef(env, jout);
+            continue;
+        }
+
+        if (c != NULL) {
+            jbyte *outp = (*env)->GetPrimitiveArrayCritical(env, jout, NULL);
+            if (outp != NULL) {
+                jint rc = pzip_compress_or_store(c, scratch, total, (void *) outp, (size_t) out_cap);
+                (*env)->ReleasePrimitiveArrayCritical(env, jout, outp, 0);
+                if (rc > 0 && (size_t) rc < total) {
+                    outLens[i] = rc;
+                } else if ((rc == PZIP_STORE_SENTINEL || rc >= (jint) total) && (size_t) out_cap >= total) {
+                    (*env)->SetByteArrayRegion(env, jout, 0, (jsize) total, (const jbyte *) scratch);
+                    outLens[i] = PZIP_STORE_SENTINEL;
+                }
+            }
+        }
+        (*env)->DeleteLocalRef(env, jout);
+    }
+
+    free(scratch);
+    (*env)->ReleaseIntArrayElements(env, outLensArr, outLens, 0);
+    (*env)->ReleaseLongArrayElements(env, rawSizesArr, rawSizes, JNI_ABORT);
+    (*env)->ReleaseLongArrayElements(env, crcsArr, crcs, 0);
 }

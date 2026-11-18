@@ -31,7 +31,7 @@ public abstract class ParallelJar extends Jar {
     @Optional
     public abstract Property<Boolean> getStore();
 
-    /** DEFLATE level 0..9, or -1 for the default (6). Ignored when {@link #getStore()} is true. */
+    /** DEFLATE level 0..12 (10..12 use libdeflate), or -1 for the default (6). Ignored when {@link #getStore()} is true. */
     @Input
     @Optional
     public abstract Property<Integer> getLevel();

@@ -47,8 +47,9 @@ public abstract class ParallelZipExtension {
     public abstract Property<Boolean> getSkipAlreadyCompressed();
 
     /**
-     * DEFLATE level {@code 0..9}, or {@code -1} for the default (6). Ignored when the
-     * target {@link Zip} task has {@code entryCompression = ZipEntryCompression.STORED}.
+     * DEFLATE level {@code 0..12} ({@code 10..12} use {@code libdeflate}), or {@code -1} for the
+     * default (6). Ignored when the target {@link Zip} task has
+     * {@code entryCompression = ZipEntryCompression.STORED}.
      */
     public abstract Property<Integer> getLevel();
 

@@ -414,7 +414,7 @@ public final class ParallelZipWriter {
             Future<List<Compressed>> f =
                     pool.submit(() -> {
                         Thread t = Thread.currentThread();
-                        Deflater def = deflaters.computeIfAbsent(t, k -> new Deflater(level, true));
+                        Deflater def = deflaters.computeIfAbsent(t, k -> new Deflater(jdkLevel(level), true));
                         long nh = nativeHandles.computeIfAbsent(t, k -> {
                             if (!useNative) return 0L;
                             long h = allocNativeCompressor(level);
@@ -427,6 +427,9 @@ public final class ParallelZipWriter {
             queue.put(new Item(f, permits));
         }
 
+        private static int jdkLevel(int level) {
+            return level < 0 ? Deflater.DEFAULT_COMPRESSION : Math.min(9, level);
+        }
         /** Returns 0 (meaning "unavailable, use the JDK Deflater") on any allocation failure. */
         private static long allocNativeCompressor(int level) {
             int nativeLevel = level < 0 ? 6 : level; // -1 sentinel means "zlib default"
@@ -493,11 +496,13 @@ public final class ParallelZipWriter {
         private void runWriter(Path out, boolean forceZip64) {
             List<Entry> order = new ArrayList<>();
             List<long[]> meta = new ArrayList<>();
+            List<Future<?>> pwriteFutures = new ArrayList<>();
             boolean failed = false;
             long offset = 0;
             ByteBuffer lhScratch = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
-            byte[] streamBuf = null;
-            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out), 1 << 20)) {
+            ByteBuffer stage = ByteBuffer.allocate(1 << 20);
+            try (FileChannel outChannel = FileChannel.open(out,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 while (true) {
                     Item item = queue.take();
                     if (item == POISON_ITEM) break;
@@ -513,26 +518,148 @@ public final class ParallelZipWriter {
                     if (failed || results == null) continue;   // keep draining the queue
                     for (Compressed c : results) {
                         long localOffset = offset;
-                        int lhLen = writeLocalHeader(os, lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
-                        if (c.data == null && streamBuf == null) {
-                            streamBuf = new byte[1 << 20];
+                        byte[] lhBytes = buildLocalHeaderBytes(lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
+                        int lhLen = lhBytes.length;
+                        if (c.compSize >= (256L << 10)) {
+                            offset = flushStage(outChannel, stage, offset);
+                            writeChannelFully(outChannel, ByteBuffer.wrap(lhBytes), localOffset);
+                            final long dataOffset = localOffset + lhLen;
+                            final Compressed fc = c;
+                            pwriteFutures.add(pool.submit(() -> {
+                                try {
+                                    pwritePayload(outChannel, fc, dataOffset);
+                                } catch (IOException ioe) {
+                                    throw new UncheckedIOException(ioe);
+                                }
+                            }));
+                            offset = dataOffset + c.compSize;
+                        } else {
+                            if (c.data == null) {
+                                // Flush staged entries before writing header + streamed payload directly.
+                                offset = flushStage(outChannel, stage, offset);
+                                writeChannelFully(outChannel, ByteBuffer.wrap(lhBytes), localOffset);
+                                if (c.streamFrom != null) {
+                                    pwritePayload(outChannel, c, localOffset + lhLen);
+                                }
+                            } else {
+                                if (stage.remaining() < lhLen + c.compSize) {
+                                    flushStageAtCurrentPos(outChannel, stage, offset - stage.position());
+                                }
+                                stage.put(lhBytes);
+                                if (c.compSize > 0) {
+                                    stage.put(c.data, 0, (int) c.compSize);
+                                }
+                            }
+                            offset += lhLen + c.compSize;
                         }
-                        writePayload(os, c, streamBuf);
-                        offset += lhLen + c.compSize;
                         order.add(c.e);
                         meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
                         stats[0] += c.rawSize; stats[1] += c.compSize;
                     }
                 }
                 if (!failed) {
+                    flushStageAtCurrentPos(outChannel, stage, offset - stage.position());
+                    for (Future<?> pf : pwriteFutures) {
+                        try {
+                            pf.get();
+                        } catch (Exception ex) {
+                            throw asIO(ex);
+                        }
+                    }
                     byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
-                    os.write(tail);
+                    writeChannelFully(outChannel, ByteBuffer.wrap(tail), offset);
                     archiveSize = offset + tail.length;
                     entryCount = order.size();
                 }
             } catch (Exception ex) {
                 if (writerError == null) writerError = asIO(ex);
             }
+        }
+
+        private static long flushStage(FileChannel ch, ByteBuffer stage, long currentOffset) throws IOException {
+            if (stage.position() > 0) {
+                flushStageAtCurrentPos(ch, stage, currentOffset - stage.position());
+            }
+            return currentOffset;
+        }
+
+        private static void flushStageAtCurrentPos(FileChannel ch, ByteBuffer stage, long pos) throws IOException {
+            if (stage.position() == 0) return;
+            stage.flip();
+            writeChannelFully(ch, stage, pos);
+            stage.clear();
+        }
+
+        private static void writeChannelFully(FileChannel ch, ByteBuffer buf, long offset) throws IOException {
+            long pos = offset;
+            while (buf.hasRemaining()) {
+                int w = ch.write(buf, pos);
+                pos += w;
+            }
+        }
+
+        private static void pwritePayload(FileChannel outChannel, Compressed c, long dataOffset) throws IOException {
+            if (c.data != null) {
+                if (c.compSize > 0) {
+                    writeChannelFully(outChannel, ByteBuffer.wrap(c.data, 0, (int) c.compSize), dataOffset);
+                }
+                return;
+            }
+            if (c.streamFrom == null) return;
+            try {
+                if (c.compSize > 0) {
+                    byte[] buf = new byte[1 << 20];
+                    ByteBuffer bb = ByteBuffer.wrap(buf);
+                    try (FileChannel in = FileChannel.open(c.streamFrom, StandardOpenOption.READ)) {
+                        long inPos = 0;
+                        long outPos = dataOffset;
+                        while (inPos < c.compSize) {
+                            bb.clear();
+                            int r = in.read(bb, inPos);
+                            if (r <= 0) break;
+                            bb.flip();
+                            writeChannelFully(outChannel, bb, outPos);
+                            inPos += r;
+                            outPos += r;
+                        }
+                    }
+                }
+            } finally {
+                if (c.streamIsTemp) Files.deleteIfExists(c.streamFrom);
+            }
+        }
+
+        private static byte[] buildLocalHeaderBytes(ByteBuffer scratch, Entry e, long crc, long compSize,
+                                                    long rawSize, int method, boolean forceZip64) {
+            byte[] nameBytes = e.nameBytes;
+            boolean needZip64 = forceZip64 || rawSize >= MAX32 || compSize >= MAX32;
+            int extraLen = needZip64 ? 20 : 0;
+            int total = 30 + nameBytes.length + extraLen;
+            ByteBuffer b = scratch.capacity() >= total
+                    ? scratch : ByteBuffer.allocate(total).order(ByteOrder.LITTLE_ENDIAN);
+            b.clear();
+            b.putInt(LFH_SIG);
+            b.putShort((short) (needZip64 ? 45 : 20));
+            b.putShort((short) FLAG_UTF8);
+            b.putShort((short) method);
+            b.putShort((short) e.dosTime);
+            b.putShort((short) e.dosDate);
+            b.putInt((int) crc);
+            b.putInt(needZip64 ? (int) MAX32 : (int) compSize);
+            b.putInt(needZip64 ? (int) MAX32 : (int) rawSize);
+            b.putShort((short) nameBytes.length);
+            b.putShort((short) extraLen);
+            b.put(nameBytes);
+            if (needZip64) {
+                b.putShort((short) Z64_EXTRA_ID);
+                b.putShort((short) 16);
+                b.putLong(rawSize);
+                b.putLong(compSize);
+            }
+            byte[] out = new byte[total];
+            b.flip();
+            b.get(out);
+            return out;
         }
 
         private static IOException asIO(Exception ex) {
@@ -612,12 +739,51 @@ public final class ParallelZipWriter {
                                                          boolean skipAlreadyCompressed) {
         int n = batch.size();
         Compressed[] result = new Compressed[n];
+
+        // Fast native file-open/sniff/compress batch for unfiltered disk files (avoids Java
+        // Files.readAllBytes + InputStream wrappers on 20k-file corpora).
+        int fileCount = 0;
+        int[] fileIdx = new int[n];
+        for (int i = 0; i < n; i++) {
+            Entry e = batch.get(i);
+            if (e.file != null && !e.fileIsTemp && e.inline == null && e.size > 0) {
+                fileIdx[fileCount++] = i;
+            }
+        }
+        if (fileCount >= 4) {
+            String[] paths = new String[fileCount];
+            byte[][] outs = new byte[fileCount][];
+            int[] outLens = new int[fileCount];
+            long[] rawSizes = new long[fileCount];
+            long[] crcs = new long[fileCount];
+            for (int k = 0; k < fileCount; k++) {
+                Entry e = batch.get(fileIdx[k]);
+                paths[k] = e.file.toAbsolutePath().toString();
+                int len = (int) e.size;
+                outs[k] = new byte[len + (len >> 12) + 64];
+                rawSizes[k] = e.size;
+            }
+            LibdeflateNative.compressFilesBatch(
+                    nativeHandle, paths, outs, outLens, rawSizes, crcs, fileCount, false, skipAlreadyCompressed);
+            for (int k = 0; k < fileCount; k++) {
+                int i = fileIdx[k];
+                Entry e = batch.get(i);
+                int len = (int) e.size;
+                if (outLens[k] == LibdeflateNative.STORE_SENTINEL) {
+                    result[i] = new Compressed(e, outs[k], null, false, crcs[k], len, len, 0);
+                } else if (outLens[k] > 0 && outLens[k] < len) {
+                    result[i] = new Compressed(e, outs[k], null, false, crcs[k], len, outLens[k], 8);
+                }
+            }
+        }
+
         byte[][] rawByIndex = new byte[n][];
         int[] nativeIdx = new int[n];
         int nativeCount = 0;
         CRC32 crc = null;
 
         for (int i = 0; i < n; i++) {
+            if (result[i] != null) continue;
             Entry e = batch.get(i);
             byte[] raw = readSmallEntry(e);
             rawByIndex[i] = raw;
@@ -823,6 +989,12 @@ public final class ParallelZipWriter {
             crcOf(e.file, crc);
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
+        if (e.size > mmapThreshold) {
+            Compressed chunked = tryParallelChunkedDeflate(e, def, spillDir);
+            if (chunked != null) {
+                return chunked;
+            }
+        }
         CRC32 crc = new CRC32();
         Path tmp = Files.createTempFile(spillDir.get(), "e", ".z");
         long compSize = deflateToFile(e.file, tmp, def, crc);
@@ -832,6 +1004,136 @@ public final class ParallelZipWriter {
         }
         if (e.fileIsTemp) Files.deleteIfExists(e.file); // input temp fully consumed
         return new Compressed(e, null, tmp, true, crc.getValue(), e.size, compSize, 8);
+    }
+
+    private static final int CHUNKED_BLOCK_BYTES = 4 << 20; // 4 MiB
+
+    /**
+     * Compresses a very large (>128 MiB) file in 4 MiB chunks across worker threads using
+     * {@link Deflater#SYNC_FLUSH}, stitching the byte-aligned raw DEFLATE streams and combining
+     * per-chunk CRCs via {@link #crc32Combine}.
+     */
+    private static Compressed tryParallelChunkedDeflate(Entry e, Deflater templateDef, Supplier<Path> spillDir)
+            throws IOException {
+        long totalSize = e.size;
+        int numChunks = (int) ((totalSize + CHUNKED_BLOCK_BYTES - 1) / CHUNKED_BLOCK_BYTES);
+        if (numChunks <= 1) return null;
+
+        int workers = Math.min(numChunks, Math.min(Runtime.getRuntime().availableProcessors(), 8));
+        ExecutorService chunkPool = Executors.newFixedThreadPool(workers);
+        Path tmp = Files.createTempFile(spillDir.get(), "e-chunked", ".z");
+        try {
+            record ChunkOut(byte[] data, long crc, int rawLen) {}
+            List<Future<ChunkOut>> futures = new ArrayList<>(numChunks);
+            for (int i = 0; i < numChunks; i++) {
+                final long offset = (long) i * CHUNKED_BLOCK_BYTES;
+                final int len = (int) Math.min(CHUNKED_BLOCK_BYTES, totalSize - offset);
+                futures.add(chunkPool.submit(() -> {
+                    byte[] raw = new byte[len];
+                    try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
+                        ByteBuffer bb = ByteBuffer.wrap(raw);
+                        long p = offset;
+                        while (bb.hasRemaining()) {
+                            int r = ch.read(bb, p);
+                            if (r < 0) break;
+                            p += r;
+                        }
+                    }
+                    CRC32 c = new CRC32();
+                    c.update(raw, 0, len);
+                    Deflater d = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+                    try {
+                        d.setInput(raw, 0, len);
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream(len + 1024);
+                        byte[] outBuf = new byte[64 * 1024];
+                        while (!d.needsInput()) {
+                            int n = d.deflate(outBuf, 0, outBuf.length, Deflater.NO_FLUSH);
+                            if (n > 0) baos.write(outBuf, 0, n);
+                        }
+                        int flushed;
+                        do {
+                            flushed = d.deflate(outBuf, 0, outBuf.length, Deflater.SYNC_FLUSH);
+                            if (flushed > 0) baos.write(outBuf, 0, flushed);
+                        } while (flushed == outBuf.length);
+                        return new ChunkOut(baos.toByteArray(), c.getValue(), len);
+                    } finally {
+                        d.end();
+                    }
+                }));
+            }
+
+            long combinedCrc = 0L;
+            long compSize = 0L;
+            try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
+                for (int i = 0; i < numChunks; i++) {
+                    ChunkOut co = futures.get(i).get();
+                    out.write(co.data());
+                    compSize += co.data().length;
+                    combinedCrc = (i == 0) ? co.crc() : crc32Combine(combinedCrc, co.crc(), co.rawLen());
+                }
+                // Terminate the raw DEFLATE stream with a BFINAL=1 empty fixed-Huffman block.
+                out.write(0x03);
+                out.write(0x00);
+                compSize += 2;
+            }
+
+            if (compSize >= e.size) {
+                Files.deleteIfExists(tmp);
+                return new Compressed(e, null, e.file, e.fileIsTemp, combinedCrc, e.size, e.size, 0);
+            }
+            if (e.fileIsTemp) Files.deleteIfExists(e.file);
+            return new Compressed(e, null, tmp, true, combinedCrc, e.size, compSize, 8);
+        } catch (Exception ex) {
+            Files.deleteIfExists(tmp);
+            return null;
+        } finally {
+            chunkPool.shutdownNow();
+        }
+    }
+
+    /** Combines two CRC-32 values: {@code crc32(buf1 + buf2) == crc32Combine(crc32(buf1), crc32(buf2), buf2.length)}. */
+    static long crc32Combine(long crc1, long crc2, long len2) {
+        if (len2 <= 0) return crc1;
+        long[] even = new long[32];
+        long[] odd = new long[32];
+        odd[0] = 0xEDB88320L;
+        long row = 1L;
+        for (int n = 1; n < 32; n++) {
+            odd[n] = row;
+            row <<= 1;
+        }
+        gf2MatrixSquare(even, odd);
+        gf2MatrixSquare(odd, even);
+        long c1 = crc1;
+        long rem = len2;
+        do {
+            gf2MatrixSquare(even, odd);
+            if ((rem & 1L) != 0) c1 = gf2MatrixTimes(even, c1);
+            rem >>>= 1;
+            if (rem == 0) break;
+            gf2MatrixSquare(odd, even);
+            if ((rem & 1L) != 0) c1 = gf2MatrixTimes(odd, c1);
+            rem >>>= 1;
+        } while (rem != 0);
+        return (c1 ^ crc2) & 0xFFFFFFFFL;
+    }
+
+    private static long gf2MatrixTimes(long[] mat, long vec) {
+        long sum = 0;
+        int idx = 0;
+        long v = vec;
+        while (v != 0) {
+            if ((v & 1L) != 0) sum ^= mat[idx];
+            v >>>= 1;
+            idx++;
+        }
+        return sum;
+    }
+
+    private static void gf2MatrixSquare(long[] square, long[] mat) {
+        for (int n = 0; n < 32; n++) {
+            square[n] = gf2MatrixTimes(mat, mat[n]);
+        }
     }
 
     /**
