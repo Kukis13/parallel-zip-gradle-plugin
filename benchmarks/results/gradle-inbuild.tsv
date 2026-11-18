@@ -1,11 +1,11 @@
 project	task	stockZipMs	skipTrueMs	skipFalseMs	stockSizeBytes	skipTrueSizeBytes	skipFalseSizeBytes	confidence	notes
-JBake	:jbake-dist:distZip	2964.5	68.6	368.0	90670297	97424591	90891609	medium	JDK 17 daemon required (Gradle 7.3.3 wrapper)
-Gradle Profiler	:distZip	1078	37	184	35241710	38164115	35161550	medium	4 warm readings, first cold discarded; JDK 21.0.1
-Gradle (the tool)	:distributions-full:binDistributionZip	4000.5	138	846	150458875	169051255	151854054	high	Isolated Projects/config-cache enabled; JDK 25 auto-selected via gradle-daemon-jvm.properties
-Spring Boot CLI	:cli:spring-boot-cli:zip	250.99	9.76	97.75	7405499	8652099	7384256	medium	JDK 25 daemon required
-JBang	:distZip	375.5	16.95	162.5	13456948	14917936	13416938	medium	JDK 21+ on PATH
-Grails CLI	:grails-shell-cli:distZip	1840.65	83.45	177.93	56776056	63051743	56650593	high	3 warm readings each, tight/consistent; JDK 21 daemon
-Groovy	:groovy-binary:distBin	1380.04	67.31	253.98	47929783	53068431	47819923	high	3 warm readings each, tight/consistent
-Micronaut Starter CLI	:micronaut-cli:distZip	1046.5	72.22	89.04	32710359	37032781	34345423	low	true-mode readings noisy (30-100ms range); JDK 25 daemon required
-SonarQube	:sonar-application:zip	23310	3960	5560	931980721	990335547	939154091	high	3 warm readings each, very tight/consistent
-dj-session-export (serato-convert)	:serato-convert:zipMingwX64	299.49	88.39	85.66	2370370	2330223	2330223	medium	First Kotlin/Native (mingwX64-only) project benchmarked, not JVM; archive is a linked .exe + 3 bundled MinGW runtime DLLs, no jar/gzip-style content, so skipAlreadyCompressed has no effect (none of the 4 entries match a magic-byte signature, both modes hit real DEFLATE via native libdeflate). ParallelZip is ~1.7% *smaller* than stock here, the only project in this table where that's true. 3 warm readings each; readings swing 80-103ms, sub-100ms scale.
+JBake	:jbake-dist:distZip	2964.5	59.44	250.24	90670297	97424591	90891609	medium	JDK 17 daemon required (Gradle 7.3.3 wrapper)
+Gradle Profiler	:distZip	1078	21.00	145.00	35241710	38166724	35163897	medium	3 warm readings, first cold discarded; JDK 21
+Gradle (the tool)	:distributions-full:binDistributionZip	4000.5	125.00	714.00	150458875	169051256	151854055	high	Isolated Projects/config-cache enabled; JDK 25 daemon
+Spring Boot CLI	:cli:spring-boot-cli:zip	250.99	8.90	72.93	7405499	8673157	7404064	medium	JDK 25 daemon required
+JBang	:distZip	375.5	15.36	129.56	13456948	14917936	13416938	medium	JDK 21+ on PATH
+Grails CLI	:grails-shell-cli:distZip	1840.65	54.49	155.66	56776056	63051743	56650593	high	3 warm readings each; JDK 21 daemon
+Groovy	:groovy-binary:distBin	1380.04	47.36	192.17	47929783	53068431	47819923	high	3 warm readings each; JDK 21 daemon
+Micronaut Starter CLI	:micronaut-cli:distZip	1046.5	72.22	89.04	32710359	37032781	34345423	low	Carried over from 1.4.1 (5.1.1-SNAPSHOT BOM expired from Sonatype Snapshots); JDK 25 daemon required
+SonarQube	:sonar-application:zip	23310	4132.59	5890.12	931980721	990538569	939154096	high	3 warm readings each, very tight/consistent
+dj-session-export (serato-convert)	:serato-convert:zipMingwX64	299.49	61.30	59.52	2370370	2330223	2330223	medium	Kotlin/Native (mingwX64-only) project; archive is a linked .exe + 3 bundled MinGW runtime DLLs, so skipAlreadyCompressed has no effect (both modes hit real DEFLATE via native libdeflate).

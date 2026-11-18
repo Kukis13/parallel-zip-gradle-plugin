@@ -22,12 +22,12 @@ too large to summarize with one number.
 
 | Project | Task | Stock `Zip` | `skipAlreadyCompressed=true` | `skipAlreadyCompressed=false` |
 |---|---|--:|--:|--:|
-| JBake | `jbake-dist:distZip` | 2.965 s | 0.069 s (**43.2×**, +7.5% size) | 0.368 s (**8.06×**, +0.2% size) |
-| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.001 s | 0.138 s (**29.0×**, +12.4% size) | 0.846 s (**4.73×**, +0.9% size) |
-| JBang | `distZip` | 0.376 s | 0.017 s (**22.2×**, +10.9% size) | 0.163 s (**2.31×**, −0.3% size) |
-| Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.083 s (**22.1×**, +11.1% size) | 0.178 s (**10.35×**, −0.2% size) |
-| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s (**5.89×**, +6.3% size) | 5.56 s (**4.19×**, +0.8% size) |
-| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.088 s (**3.39×**, −1.7% size) | 0.086 s (**3.50×**, −1.7% size) |
+| JBake | `jbake-dist:distZip` | 2.965 s | 0.059 s (**49.9×**, +7.5% size) | 0.250 s (**11.8×**, +0.2% size) |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.001 s | 0.125 s (**32.0×**, +12.4% size) | 0.714 s (**5.60×**, +0.9% size) |
+| JBang | `distZip` | 0.376 s | 0.015 s (**24.4×**, +10.9% size) | 0.130 s (**2.90×**, −0.3% size) |
+| Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.054 s (**33.8×**, +11.1% size) | 0.156 s (**11.8×**, −0.2% size) |
+| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 4.13 s (**5.64×**, +6.3% size) | 5.89 s (**3.96×**, +0.8% size) |
+| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.061 s (**4.89×**, −1.7% size) | 0.060 s (**5.03×**, −1.7% size) |
 
 Not just JVM projects: the last row is a `kotlin("multiplatform")` project targeting
 `mingwX64` only, archiving a linked native `.exe` and its runtime DLLs — `ParallelZip` is a
@@ -35,12 +35,12 @@ generic `CopySpec`/`AbstractArchiveTask` swap, so it doesn't care what's inside.
 the only project here where the archive comes out *smaller* than stock, since none of its
 content matches an already-compressed signature.
 
-Geometric-mean speedup over stock across ten real production Zip tasks: **~17.5×** with
-`skipAlreadyCompressed=true`, **~5.14×** with it `false`. The size cost follows the same
-split: `true` mode ranges from **−1.7% to +16.8%** across all ten projects (negative only
+Geometric-mean speedup over stock across the nine freshly measured production Zip tasks: **~22.6×** with
+`skipAlreadyCompressed=true`, **~5.87×** with it `false`. The size cost follows the same
+split: `true` mode ranges from **−1.7% to +17.1%** across all ten projects (negative only
 on the Kotlin/Native project, which has no already-compressed content to STORE instead of
 DEFLATE); `false` mode stays within about **±1.7%** of stock in nine of ten (one outlier at
-+5.0%) while still beating stock by 2.3×–11.8×. Pick `true` for the fastest builds, `false`
++5.0%) while still beating stock by 2.9×–11.8×. Pick `true` for the fastest builds, `false`
 when archive size matters more than shaving the last bit of time off an already-fast task.
 Full breakdown, all ten projects, and the eleven-project fixed-corpus benchmarks →
 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
@@ -53,7 +53,7 @@ conventions as `Zip`. Swapping `type: Zip` for `type: ParallelZip` needs no othe
 
 ```groovy
 plugins {
-    id 'com.ljarocki.parallel-zip' version '1.4.3'
+    id 'com.ljarocki.parallel-zip' version '1.5.0'
 }
 
 tasks.register('dist', com.ljarocki.parallelzip.ParallelZip) {

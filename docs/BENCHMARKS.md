@@ -1,6 +1,6 @@
 # Benchmarks
 
-Every table on this page compares **three points**, all on the same 1.4.1 build so only
+Every table on this page compares **three points**, all on the same 1.5.0 build so only
 the `skipAlreadyCompressed` flag varies, not plugin version: stock Gradle `Zip`, `ParallelZip`
 with `skipAlreadyCompressed = true` (the default), and `skipAlreadyCompressed = false`. The
 flag matters enough for both speed *and* size that any single number without saying which
@@ -21,16 +21,18 @@ each project's build required), each project measured in isolation.
 
 | Project | Task | Stock `Zip` | `skipAlreadyCompressed=true` | `skipAlreadyCompressed=false` | Speedup (true) | Speedup (false) | Size Δ (true) | Size Δ (false) |
 |---|---|--:|--:|--:|--:|--:|--:|--:|
-| JBake | `jbake-dist:distZip` | 2.965 s | 0.069 s | 0.368 s | **43.2×** | **8.06×** | +7.45% | +0.24% |
-| Gradle Profiler | `distZip` | 1.078 s | 0.037 s | 0.184 s | **29.1×** | **5.86×** | +8.30% | −0.23% |
-| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.001 s | 0.138 s | 0.846 s | **29.0×** | **4.73×** | +12.36% | +0.93% |
-| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.251 s | 0.010 s | 0.098 s | **25.7×** | **2.57×** | +16.84% | −0.29% |
-| JBang | `distZip` | 0.376 s | 0.017 s | 0.163 s | **22.2×** | **2.31×** | +10.86% | −0.30% |
-| Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.083 s | 0.178 s | **22.1×** | **10.35×** | +11.05% | −0.22% |
-| Groovy 4.0.24 | `groovy-binary:distBin` | 1.380 s | 0.067 s | 0.254 s | **20.5×** | **5.43×** | +10.72% | −0.23% |
-| Micronaut Starter (Launch) CLI | `distZip` | 1.047 s | 0.072 s | 0.089 s | **14.5×** | **11.8×** | +13.21% | +5.00% |
-| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 3.96 s | 5.56 s | **5.89×** | **4.19×** | +6.26% | +0.77% |
-| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.088 s | 0.086 s | **3.39×** | **3.50×** | −1.69% | −1.69% |
+| JBake | `jbake-dist:distZip` | 2.965 s | 0.059 s | 0.250 s | **49.9×** | **11.8×** | +7.45% | +0.24% |
+| Gradle Profiler | `distZip` | 1.078 s | 0.021 s | 0.145 s | **51.3×** | **7.43×** | +8.30% | −0.22% |
+| Gradle (the build tool) | `distributions-full:binDistributionZip` | 4.001 s | 0.125 s | 0.714 s | **32.0×** | **5.60×** | +12.36% | +0.93% |
+| Spring Boot CLI | `cli:spring-boot-cli:zip` | 0.251 s | 0.009 s | 0.073 s | **28.2×** | **3.44×** | +17.12% | −0.02% |
+| JBang | `distZip` | 0.376 s | 0.015 s | 0.130 s | **24.4×** | **2.90×** | +10.86% | −0.30% |
+| Grails CLI | `grails-shell-cli:distZip` | 1.841 s | 0.054 s | 0.156 s | **33.8×** | **11.8×** | +11.05% | −0.22% |
+| Groovy 4.0.24 | `groovy-binary:distBin` | 1.380 s | 0.047 s | 0.192 s | **29.1×** | **7.18×** | +10.72% | −0.23% |
+| Micronaut Starter (Launch) CLI¹ | `distZip` | 1.047 s | 0.072 s | 0.089 s | **14.5×** | **11.8×** | +13.21% | +5.00% |
+| SonarQube (Community Build) | `sonar-application:zip` | 23.31 s | 4.13 s | 5.89 s | **5.64×** | **3.96×** | +6.28% | +0.77% |
+| dj-session-export (Kotlin/Native) | `serato-convert:zipMingwX64` | 0.299 s | 0.061 s | 0.060 s | **4.89×** | **5.03×** | −1.69% | −1.69% |
+
+¹ Carried over from the 1.4.1 benchmark run (`5.1.1-SNAPSHOT` BOM expired from Sonatype Snapshots).
 
 The last row is the odd one out on purpose: it's the only non-JVM project in this table —
 a `kotlin("multiplatform")` project targeting `mingwX64` only, archiving a linked native
@@ -46,16 +48,16 @@ doesn't care what's inside — it's that a real Kotlin/Native distribution archi
 perfectly ordinary `Zip` task, and (see [ARCHITECTURE.md](ARCHITECTURE.md)) an archive with
 no already-compressed content is exactly the case where the two modes converge.
 
-Geometric-mean speedup over stock `Zip` across these ten tasks: **~17.5×** with
-`skipAlreadyCompressed=true`, **~5.14×** with it set `false` (both pulled down from the
-nine-JVM-project figures by the Kotlin/Native row's much smaller, sub-100ms archive, where
+Geometric-mean speedup over stock `Zip` across the nine freshly measured tasks: **~22.6×** with
+`skipAlreadyCompressed=true`, **~5.87×** with it set `false` (both pulled down from the
+JVM-project figures by the Kotlin/Native row's much smaller, sub-100ms archive, where
 fixed per-task overhead dominates and there's little already-compressed content to skip in
 the first place). Both modes are a clear win over stock every single time — the choice
 between them is purely about how much archive size you're willing to trade for the
 difference between "very fast" and "extremely fast."
 
 **Size, both modes, no cherry-picking**: `skipAlreadyCompressed=true` ranges from **−1.69%
-to +16.84%** across all ten projects — larger than stock everywhere there's
+to +17.12%** across all ten projects — larger than stock everywhere there's
 already-compressed content to STORE instead of DEFLATE, smaller than stock on the one
 project (Kotlin/Native) that has none. `skipAlreadyCompressed=false` stays within about
 **±1%** of stock in eight of the ten projects (as tight as −0.30%, i.e. sometimes *smaller*
@@ -125,7 +127,7 @@ Notes on measurement method:
 ## Fixed-corpus benchmarks (static directory tree)
 
 A complementary methodology: eleven popular open-source projects' official binary
-distributions, archived three ways — Gradle `Zip` (baseline), `parallel-zip` 1.4.1 with
+distributions, archived three ways — Gradle `Zip` (baseline), `parallel-zip` 1.5.0 with
 `skipAlreadyCompressed=true`, and with it `false` — using a fixed staging directory so
 only the archiving mode varies, not each project's own compile/download chain. Same
 machine, JDK 21, warm cache, `-Xmx4g` daemon for every project for consistency (only
@@ -133,17 +135,17 @@ strictly required for Hadoop's ~1.7 GiB corpus).
 
 | Project | Files | Raw size | Gradle `Zip` | `skipAlreadyCompressed=true` | `skipAlreadyCompressed=false` | Speedup (true) | Speedup (false) | Size Δ (true) | Size Δ (false) |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| SonarQube Community Build | 645 | 931.1 MiB | 29.76 s | 0.65 s | 3.60 s | **46.1×** | **8.28×** | +6.45% | +0.73% |
-| Gradle 8.14.3 | 317 | 145.1 MiB | 4.02 s | 0.09 s | 0.92 s | **45.3×** | **4.37×** | +10.73% | +0.86% |
-| Groovy 4.0.24 | 102 | 31.8 MiB | 1.01 s | 0.03 s | 0.13 s | **38.4×** | **7.94×** | +10.92% | +0.03% |
-| Cassandra 4.1.7 | 200 | 57.1 MiB | 1.99 s | 0.05 s | 0.23 s | **39.3×** | **8.79×** | +7.03% | −0.31% |
-| Kafka 3.8.1 | 235 | 120.4 MiB | 3.35 s | 0.09 s | 0.23 s | **36.6×** | **14.47×** | +4.00% | +0.55% |
-| Flink 1.20.0 | 167 | 502.4 MiB | 13.17 s | 0.39 s | 2.04 s | **33.9×** | **6.46×** | +8.84% | +0.24% |
-| Spark 3.5.3 | 1,825 | 423.6 MiB | 12.78 s | 0.43 s | 1.90 s | **30.0×** | **6.73×** | +6.93% | +0.50% |
-| Solr 9.7.0 | 2,091 | 304.4 MiB | 8.91 s | 0.33 s | 1.12 s | **26.9×** | **7.95×** | +9.21% | +0.20% |
-| HBase 2.6.1 | 2,588 | 397.1 MiB | 12.05 s | 0.54 s | 1.40 s | **22.5×** | **8.59×** | +10.58% | +0.16% |
-| Hadoop 3.4.0¹ | 20,220 | 1,681.2 MiB | 172.93 s | 8.61 s | 22.23 s | **20.1×** | **7.78×** | +12.17% | +0.05% |
-| ZooKeeper 3.9.3 | 1,632 | 46.5 MiB | 1.50 s | 0.21 s | 0.26 s | **7.20×** | **5.67×** | +4.75% | −0.00% |
+| SonarQube Community Build | 645 | 931.1 MiB | 29.76 s | 0.48 s | 2.17 s | **61.9×** | **13.71×** | +6.45% | +0.73% |
+| Gradle 8.14.3 | 317 | 145.1 MiB | 4.02 s | 0.08 s | 0.61 s | **49.1×** | **6.62×** | +10.73% | +0.86% |
+| Groovy 4.0.24 | 102 | 31.8 MiB | 1.01 s | 0.02 s | 0.10 s | **42.1×** | **10.21×** | +10.92% | +0.03% |
+| Cassandra 4.1.7 | 200 | 57.1 MiB | 1.99 s | 0.04 s | 0.17 s | **50.9×** | **11.73×** | +7.03% | −0.31% |
+| Kafka 3.8.1 | 235 | 120.4 MiB | 3.35 s | 0.06 s | 0.18 s | **54.1×** | **18.75×** | +4.00% | +0.55% |
+| Flink 1.20.0 | 167 | 502.4 MiB | 13.17 s | 0.22 s | 1.45 s | **59.0×** | **9.06×** | +8.84% | +0.24% |
+| Spark 3.5.3 | 1,825 | 423.6 MiB | 12.78 s | 0.34 s | 1.40 s | **37.5×** | **9.11×** | +6.93% | +0.50% |
+| Solr 9.7.0 | 2,091 | 304.4 MiB | 8.91 s | 0.25 s | 0.86 s | **36.0×** | **10.30×** | +9.21% | +0.20% |
+| HBase 2.6.1 | 2,588 | 397.1 MiB | 12.05 s | 0.43 s | 1.15 s | **28.1×** | **10.46×** | +10.58% | +0.16% |
+| Hadoop 3.4.0¹ | 20,220 | 1,681.2 MiB | 172.93 s | 6.92 s | 17.72 s | **25.0×** | **9.76×** | +12.17% | +0.05% |
+| ZooKeeper 3.9.3 | 1,632 | 46.5 MiB | 1.50 s | 0.14 s | 0.17 s | **10.8×** | **8.72×** | +4.75% | −0.00% |
 
 ¹ Ran with `-Xmx4g` like every other row here, and needed it — this is the 20k-file,
 1.7 GiB corpus. Windows `tar` couldn't materialize 3 native-library symlinks during
