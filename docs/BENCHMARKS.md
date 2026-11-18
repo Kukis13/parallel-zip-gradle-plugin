@@ -1,13 +1,51 @@
 # Benchmarks
 
-Every table on this page compares **three points**, all on the same 1.5.0 build so only
+## v2.0.0 Benchmarks (3-run warm medians)
+
+Measured on the same 12-core Windows machine (`-Xmx4g` for fixed-corpus tasks), discarding the
+first warmup run and taking the median of 3 warm runs via `doFirst`/`doLast` `System.nanoTime()`
+hooks.
+
+### In-build zero-config acceleration (`ParallelZipPlugin` on stock `Zip`)
+
+Applied via `id 'com.ljarocki.parallel-zip'` with no task type changes (`accelerateAllZipTasks = true`):
+
+| Project | Task | Stock `Zip` | v2.0.0 (`skip=true`) | v2.0.0 (`skip=false`) | Speedup (`true`) | Speedup (`false`) | Size Δ (`true`) | Size Δ (`false`) |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| SonarQube (Community Build) | `sonar-application:zip` | 22.67 s | **3.82 s** | **5.77 s** | **5.93×** | **3.93×** | +6.44% | +0.74% |
+
+*(1.5.0 on SonarQube was `4.13 s` / `5.89 s` against a `23.31 s` stock baseline.)*
+
+### `ParallelZipFastPath` & v2.0.0 workloads (Gradle `ParallelZip` task vs stock `Zip`)
+
+Unfiltered directory `CopySpec`s bypass Gradle's single-threaded `CopyActionProcessingStream`
+via `ParallelZipFastPath`, exercise native `compressFilesBatch` on small-file batches, positional
+`pwrite` on large entries, and `libdeflate_deflate_compress_nonfinal` chunking on `> 128 MiB` files:
+
+| Corpus | Workload | Stock `Zip` | v2.0.0 (`skip=true`) | v2.0.0 (`skip=false`) | Speedup (`true`) | Speedup (`false`) | Size Δ (`true`) | Size Δ (`false`) |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| SonarQube (extracted) | 904 MiB mixed jars + JRE | 19.11 s | **0.68 s** | **1.98 s** | **28.1×** | **9.65×** | +6.44% | +0.74% |
+| Gradle 8.14.3 (`-all`) | 224 MiB distribution | 10.23 s | **0.78 s** | **1.33 s** | **13.1×** | **7.68×** | +7.70% | +0.40% |
+| 20,000-file JSON tree | `compressFilesBatch` | 1.80 s | **0.25 s** | — | **7.36×** | — | −0.00% | — |
+| 256 MiB single log file | `> 128 MiB` parallel `libdeflate` | 0.87 s | **0.12 s** | — | **7.47×** | — | +1.95% | — |
+
+### `ParallelTarGz` (pigz-style parallel block gzip) vs stock Gradle `Tar` (`Compression.GZIP`)
+
+| Corpus | Stock `Tar` (GZIP) | `ParallelTarGz` | Speedup | Size Δ |
+|---|--:|--:|--:|--:|
+| SonarQube (extracted) | 22.13 s | **0.89 s** | **24.8×** | +2.25% |
+| Gradle 8.14.3 (`-all`) | 10.60 s | **3.31 s** | **3.21×** | +3.90% |
+
+---
+
+## 1.5.0 Baseline: In-build benchmarks (real projects, real Zip tasks)
+
+Every table below compares **three points**, all on the same 1.5.0 build so only
 the `skipAlreadyCompressed` flag varies, not plugin version: stock Gradle `Zip`, `ParallelZip`
 with `skipAlreadyCompressed = true` (the default), and `skipAlreadyCompressed = false`. The
 flag matters enough for both speed *and* size that any single number without saying which
 mode it's from is misleading — so every size or speed claim on this page, and in the README,
 names its mode.
-
-## In-build benchmarks (real projects, real Zip tasks)
 
 The most direct evidence for this plugin isn't archiving a static directory tree — it's
 what happens when you actually swap `type: Zip` for `type: ParallelZip` in a real

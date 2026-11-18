@@ -7,5 +7,6 @@ JBang	:distZip	375.5	15.36	129.56	13456948	14917936	13416938	medium	JDK 21+ on P
 Grails CLI	:grails-shell-cli:distZip	1840.65	54.49	155.66	56776056	63051743	56650593	high	3 warm readings each; JDK 21 daemon
 Groovy	:groovy-binary:distBin	1380.04	47.36	192.17	47929783	53068431	47819923	high	3 warm readings each; JDK 21 daemon
 Micronaut Starter CLI	:micronaut-cli:distZip	1046.5	72.22	89.04	32710359	37032781	34345423	low	Carried over from 1.4.1 (5.1.1-SNAPSHOT BOM expired from Sonatype Snapshots); JDK 25 daemon required
-SonarQube	:sonar-application:zip	23310	4132.59	5890.12	931980721	990538569	939154096	high	3 warm readings each, very tight/consistent
+SonarQube	:sonar-application:zip	23310	4132.59	5890.12	931980721	990538569	939154096	high	3 warm readings each, very tight/consistent (1.5.0)
+SonarQube (2.0.0)	:sonar-application:zip	22665	3822	5772	904033105	962265347	910709460	high	3 warm readings each, zero-config auto-acceleration (2.0.0)
 dj-session-export (serato-convert)	:serato-convert:zipMingwX64	299.49	61.30	59.52	2370370	2330223	2330223	medium	Kotlin/Native (mingwX64-only) project; archive is a linked .exe + 3 bundled MinGW runtime DLLs, so skipAlreadyCompressed has no effect (both modes hit real DEFLATE via native libdeflate).
