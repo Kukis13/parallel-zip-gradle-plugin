@@ -42,6 +42,7 @@ public class ParallelZipPlugin implements Plugin<Project> {
         project.getExtensions().getExtraProperties().set("ParallelJar", ParallelJar.class);
         project.getExtensions().getExtraProperties().set("ParallelTar", ParallelTar.class);
         project.getExtensions().getExtraProperties().set("ParallelTarGz", ParallelTarGz.class);
+        project.getExtensions().getExtraProperties().set("VerifyZip", VerifyZip.class);
         ParallelZipExtension extension = project.getExtensions().create("parallelZip", ParallelZipExtension.class);
 
         Provider<Boolean> skip = extension.getSkipAlreadyCompressed();
