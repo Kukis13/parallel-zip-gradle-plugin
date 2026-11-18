@@ -990,7 +990,7 @@ public final class ParallelZipWriter {
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
         if (e.size > mmapThreshold) {
-            Compressed chunked = tryParallelChunkedDeflate(e, def, spillDir);
+            Compressed chunked = tryParallelChunkedDeflate(e, nativeHandle != 0, spillDir);
             if (chunked != null) {
                 return chunked;
             }
@@ -1010,10 +1010,11 @@ public final class ParallelZipWriter {
 
     /**
      * Compresses a very large (>128 MiB) file in 4 MiB chunks across worker threads using
-     * {@link Deflater#SYNC_FLUSH}, stitching the byte-aligned raw DEFLATE streams and combining
-     * per-chunk CRCs via {@link #crc32Combine}.
+     * {@link LibdeflateNative#compressNonFinal} (with {@link Deflater#SYNC_FLUSH} fallback),
+     * stitching the byte-aligned raw DEFLATE streams and combining per-chunk CRCs via
+     * {@link #crc32Combine}.
      */
-    private static Compressed tryParallelChunkedDeflate(Entry e, Deflater templateDef, Supplier<Path> spillDir)
+    private static Compressed tryParallelChunkedDeflate(Entry e, boolean useNative, Supplier<Path> spillDir)
             throws IOException {
         long totalSize = e.size;
         int numChunks = (int) ((totalSize + CHUNKED_BLOCK_BYTES - 1) / CHUNKED_BLOCK_BYTES);
@@ -1023,9 +1024,11 @@ public final class ParallelZipWriter {
         ExecutorService chunkPool = Executors.newFixedThreadPool(workers);
         Path tmp = Files.createTempFile(spillDir.get(), "e-chunked", ".z");
         try {
-            record ChunkOut(byte[] data, long crc, int rawLen) {}
+            record ChunkOut(byte[] data, int compLen, long crc, int rawLen, boolean hasFinal) {}
             List<Future<ChunkOut>> futures = new ArrayList<>(numChunks);
             for (int i = 0; i < numChunks; i++) {
+                final int chunkIndex = i;
+                final boolean isLast = (i == numChunks - 1);
                 final long offset = (long) i * CHUNKED_BLOCK_BYTES;
                 final int len = (int) Math.min(CHUNKED_BLOCK_BYTES, totalSize - offset);
                 futures.add(chunkPool.submit(() -> {
@@ -1037,6 +1040,23 @@ public final class ParallelZipWriter {
                             int r = ch.read(bb, p);
                             if (r < 0) break;
                             p += r;
+                        }
+                    }
+                    if (useNative) {
+                        long h = LibdeflateNative.allocCompressor(6);
+                        if (h != 0L) {
+                            try {
+                                byte[] outBuf = new byte[len + (len >> 10) + 64];
+                                long[] crcOut = new long[1];
+                                int rc = isLast
+                                        ? LibdeflateNative.compress(h, raw, 0, len, outBuf, 0, outBuf.length, crcOut)
+                                        : LibdeflateNative.compressNonFinal(h, raw, 0, len, outBuf, 0, outBuf.length, crcOut);
+                                if (rc > 0) {
+                                    return new ChunkOut(outBuf, rc, crcOut[0], len, isLast);
+                                }
+                            } finally {
+                                LibdeflateNative.freeCompressor(h);
+                            }
                         }
                     }
                     CRC32 c = new CRC32();
@@ -1055,7 +1075,8 @@ public final class ParallelZipWriter {
                             flushed = d.deflate(outBuf, 0, outBuf.length, Deflater.SYNC_FLUSH);
                             if (flushed > 0) baos.write(outBuf, 0, flushed);
                         } while (flushed == outBuf.length);
-                        return new ChunkOut(baos.toByteArray(), c.getValue(), len);
+                        byte[] outBytes = baos.toByteArray();
+                        return new ChunkOut(outBytes, outBytes.length, c.getValue(), len, false);
                     } finally {
                         d.end();
                     }
@@ -1064,17 +1085,21 @@ public final class ParallelZipWriter {
 
             long combinedCrc = 0L;
             long compSize = 0L;
+            boolean lastHadFinal = false;
             try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
                 for (int i = 0; i < numChunks; i++) {
                     ChunkOut co = futures.get(i).get();
-                    out.write(co.data());
-                    compSize += co.data().length;
+                    out.write(co.data(), 0, co.compLen());
+                    compSize += co.compLen();
                     combinedCrc = (i == 0) ? co.crc() : crc32Combine(combinedCrc, co.crc(), co.rawLen());
+                    lastHadFinal = co.hasFinal();
                 }
-                // Terminate the raw DEFLATE stream with a BFINAL=1 empty fixed-Huffman block.
-                out.write(0x03);
-                out.write(0x00);
-                compSize += 2;
+                if (!lastHadFinal) {
+                    // Terminate the raw DEFLATE stream with a BFINAL=1 empty fixed-Huffman block.
+                    out.write(0x03);
+                    out.write(0x00);
+                    compSize += 2;
+                }
             }
 
             if (compSize >= e.size) {

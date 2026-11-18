@@ -29,6 +29,7 @@ public final class LibdeflateNative {
     private static final Set<String> SUPPORTED_CLASSIFIERS = Set.of(
             "windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-arm64", "macos-x64");
 
+    private static volatile Path loadedPath;
     private static final boolean AVAILABLE = load();
 
     /**
@@ -40,6 +41,10 @@ public final class LibdeflateNative {
     public static final int STORE_SENTINEL = -2;
 
     private LibdeflateNative() {
+    }
+
+    public static Path loadedLibraryPath() {
+        return loadedPath;
     }
 
     public static boolean available() {
@@ -115,6 +120,13 @@ public final class LibdeflateNative {
             long handle, String[] paths, byte[][] outs, int[] outLens, long[] rawSizes,
             long[] crcs, int count, boolean store, boolean skipAlreadyCompressed);
 
+    /**
+     * Non-final raw DEFLATE compression for >128 MiB parallel chunking (forces BFINAL=0
+     * and appends a byte-aligned Z_SYNC_FLUSH empty stored block).
+     */
+    public static native int compressNonFinal(long handle, byte[] in, int inOff, int inLen,
+                                                byte[] out, int outOff, int outCap, long[] crcOut);
+
     private static boolean load() {
         try {
             String resource = resourcePath();
@@ -131,6 +143,7 @@ public final class LibdeflateNative {
                     in.transferTo(out);
                 }
                 System.load(tmp.toAbsolutePath().toString());
+                loadedPath = tmp.toAbsolutePath();
             }
             return true;
         } catch (IOException | UnsatisfiedLinkError | SecurityException | UncheckedIOException e) {

@@ -466,6 +466,9 @@ struct libdeflate_compressor {
 	/* Anything of this size or less we won't bother trying to compress. */
 	size_t max_passthrough_size;
 
+	/* pzip: when true, deflate_flush_block forces BFINAL=0 for chunk stitching. */
+	bool pzip_nonfinal;
+
 	/*
 	 * The maximum search depth: consider at most this many potential
 	 * matches at each position
@@ -1743,6 +1746,9 @@ deflate_flush_block(struct libdeflate_compressor *c,
 	ASSERT((bitbuf & ~(((bitbuf_t)1 << bitcount) - 1)) == 0);
 	ASSERT(out_next <= os->end);
 	ASSERT(!os->overflow);
+
+	if (unlikely(c->pzip_nonfinal))
+		is_final_block = false;
 
 	/* Precompute the precode items and build the precode. */
 	deflate_precompute_huffman_header(c);
@@ -4061,6 +4067,63 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
 	}
 
 	/* Return the compressed size in bytes. */
+	return os.next - (u8 *)out;
+}
+
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_nonfinal(struct libdeflate_compressor *c,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail)
+{
+	struct deflate_output_bitstream os;
+
+	if (unlikely(in_nbytes <= c->max_passthrough_size)) {
+		/* Fall back to standard stored blocks with BFINAL=0 + trailing empty stored block. */
+		if (out_nbytes_avail < in_nbytes + 10)
+			return 0;
+		u8 *p = (u8 *)out;
+		size_t rem = in_nbytes;
+		const u8 *src = (const u8 *)in;
+		do {
+			u16 chunk = (u16)MIN(rem, UINT16_MAX);
+			*p++ = 0x00; /* BFINAL=0, BTYPE=00 */
+			*p++ = (u8)chunk;
+			*p++ = (u8)(chunk >> 8);
+			*p++ = (u8)(~chunk);
+			*p++ = (u8)((~chunk) >> 8);
+			if (chunk > 0) {
+				memcpy(p, src, chunk);
+				p += chunk;
+				src += chunk;
+				rem -= chunk;
+			}
+		} while (rem > 0);
+		return p - (u8 *)out;
+	}
+
+	os.bitbuf = 0;
+	os.bitcount = 0;
+	os.next = out;
+	os.end = os.next + out_nbytes_avail;
+	os.overflow = false;
+
+	c->pzip_nonfinal = true;
+	(*c->impl)(c, in, in_nbytes, &os);
+	c->pzip_nonfinal = false;
+
+	if (os.overflow || (size_t)(os.end - os.next) < 6)
+		return 0;
+
+	/* Append 3-bit BFINAL=0, BTYPE=00 header and flush to byte boundary + empty stored block. */
+	os.bitcount += 3;
+	*os.next++ = (u8)os.bitbuf;
+	if (os.bitcount > 8)
+		*os.next++ = (u8)(os.bitbuf >> 8);
+	*os.next++ = 0x00;
+	*os.next++ = 0x00;
+	*os.next++ = 0xFF;
+	*os.next++ = 0xFF;
+
 	return os.next - (u8 *)out;
 }
 

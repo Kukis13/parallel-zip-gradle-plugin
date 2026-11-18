@@ -87,6 +87,15 @@ libdeflate_deflate_compress(struct libdeflate_compressor *compressor,
 			    void *out, size_t out_nbytes_avail);
 
 /*
+ * Like libdeflate_deflate_compress(), but forces BFINAL=0 on all emitted blocks and appends
+ * a byte-aligned empty stored block (Z_SYNC_FLUSH), allowing parallel chunks to be stitched.
+ */
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_nonfinal(struct libdeflate_compressor *compressor,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail);
+
+/*
  * libdeflate_deflate_compress_bound() returns a worst-case upper bound on the
  * number of bytes of compressed data that may be produced by compressing any
  * buffer of length less than or equal to 'in_nbytes' using

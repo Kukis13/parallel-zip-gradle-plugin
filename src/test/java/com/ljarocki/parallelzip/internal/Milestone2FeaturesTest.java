@@ -120,4 +120,45 @@ class Milestone2FeaturesTest {
             }
         }
     }
+
+    @Test
+    void nativeCompressNonFinalStitchesWithFinalChunkCleanly() throws Exception {
+        if (!LibdeflateNative.available()) return;
+        byte[] chunk1 = "libdeflate nonfinal chunk one ".repeat(3000).getBytes(StandardCharsets.UTF_8);
+        byte[] chunk2 = "libdeflate final chunk two!   ".repeat(3000).getBytes(StandardCharsets.UTF_8);
+        byte[] expected = new byte[chunk1.length + chunk2.length];
+        System.arraycopy(chunk1, 0, expected, 0, chunk1.length);
+        System.arraycopy(chunk2, 0, expected, chunk1.length, chunk2.length);
+
+        long h = LibdeflateNative.allocCompressor(6);
+        assertTrue(h != 0L);
+        try {
+            byte[] out1 = new byte[chunk1.length + 1024];
+            byte[] out2 = new byte[chunk2.length + 1024];
+            long[] crc1 = new long[1];
+            long[] crc2 = new long[1];
+            int n1 = LibdeflateNative.compressNonFinal(h, chunk1, 0, chunk1.length, out1, 0, out1.length, crc1);
+            int n2 = LibdeflateNative.compress(h, chunk2, 0, chunk2.length, out2, 0, out2.length, crc2);
+            assertTrue(n1 > 0 && n2 > 0);
+
+            byte[] stitched = new byte[n1 + n2];
+            System.arraycopy(out1, 0, stitched, 0, n1);
+            System.arraycopy(out2, 0, stitched, n1, n2);
+
+            var inf = new java.util.zip.Inflater(true);
+            inf.setInput(stitched);
+            byte[] decoded = new byte[expected.length];
+            int total = 0;
+            while (!inf.finished()) {
+                int r = inf.inflate(decoded, total, decoded.length - total);
+                if (r == 0) break;
+                total += r;
+            }
+            inf.end();
+            assertEquals(expected.length, total);
+            assertArrayEquals(expected, decoded);
+        } finally {
+            LibdeflateNative.freeCompressor(h);
+        }
+    }
 }

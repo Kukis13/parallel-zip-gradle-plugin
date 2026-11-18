@@ -6,6 +6,16 @@
 #include <string.h>
 #include "libdeflate.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define PZIP_EXPORT __declspec(dllexport)
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#define PZIP_EXPORT __attribute__((visibility("default")))
+#endif
+
 /*
  * The compressor is now allocated once per worker thread (see
  * LibdeflateNative.allocCompressor / freeCompressor) and reused across every
@@ -40,6 +50,25 @@
 #define PZIP_SNIFF_KEEP_PCT   98u
 
 /*
+ * Fast ~2 us 4 KiB byte-frequency pre-check: if all 256 byte values appear and the max
+ * frequency is <= 36 (vs uniform mean 16), the data is near-8-bits/byte random/encrypted/
+ * compressed and can be STOREd without paying the 64 KiB DEFLATE match-finder probe.
+ */
+static int pzip_looks_incompressible_fast(const uint8_t *inp, size_t in_len) {
+    if (in_len < PZIP_SNIFF_MIN_INPUT) return 0;
+    uint16_t counts[256] = {0};
+    for (size_t i = 0; i < 4096u; i++) {
+        counts[inp[i]]++;
+    }
+    uint16_t max_c = 0;
+    for (int i = 0; i < 256; i++) {
+        if (counts[i] == 0) return 0;
+        if (counts[i] > max_c) max_c = counts[i];
+    }
+    return max_c <= 36u;
+}
+
+/*
  * Compress one whole buffer, sniffing large inputs first. Returns the
  * compressed length (> 0), PZIP_STORE_SENTINEL (-2) when the sniff says the
  * input is already compressed and should be STOREd, or -1 on any failure
@@ -49,6 +78,9 @@ static jint pzip_compress_or_store(struct libdeflate_compressor *c,
                                    const void *inp, size_t in_len,
                                    void *outp, size_t out_cap) {
     if (in_len >= PZIP_SNIFF_MIN_INPUT) {
+        if (pzip_looks_incompressible_fast((const uint8_t *) inp, in_len)) {
+            return PZIP_STORE_SENTINEL;
+        }
         size_t probe = libdeflate_deflate_compress(c, inp, PZIP_SNIFF_SAMPLE, outp, out_cap);
         if (probe == 0 || probe * 100u >= (size_t) PZIP_SNIFF_SAMPLE * PZIP_SNIFF_KEEP_PCT) {
             return PZIP_STORE_SENTINEL;
@@ -258,6 +290,11 @@ JNIEXPORT jboolean JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNati
     if (inp == NULL) {
         return JNI_FALSE;
     }
+    if (pzip_looks_incompressible_fast((const uint8_t *) inp, (size_t) inLen)) {
+        uint32_t crc = libdeflate_crc32(0, inp, (size_t) inLen);
+        pzip_set_crc_out(env, crcOut, crc);
+        return JNI_TRUE;
+    }
     uint8_t probe_buf[PZIP_SNIFF_SAMPLE];
     size_t probe = libdeflate_deflate_compress(c, inp, PZIP_SNIFF_SAMPLE, probe_buf, sizeof(probe_buf));
     if (probe == 0 || probe * 100u >= (size_t) PZIP_SNIFF_SAMPLE * PZIP_SNIFF_KEEP_PCT) {
@@ -408,4 +445,119 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
     (*env)->ReleaseIntArrayElements(env, outLensArr, outLens, 0);
     (*env)->ReleaseLongArrayElements(env, rawSizesArr, rawSizes, JNI_ABORT);
     (*env)->ReleaseLongArrayElements(env, crcsArr, crcs, 0);
+}
+
+/*
+ * Non-final raw DEFLATE compression for >128 MiB parallel chunking (forces BFINAL=0
+ * and appends a byte-aligned Z_SYNC_FLUSH empty stored block).
+ */
+JNIEXPORT jint JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_compressNonFinal(
+        JNIEnv *env, jclass clazz,
+        jlong handle,
+        jbyteArray inArr, jint inOff, jint inLen,
+        jbyteArray outArr, jint outOff, jint outCap,
+        jlongArray crcOut) {
+    (void) clazz;
+    struct libdeflate_compressor *c = (struct libdeflate_compressor *) (intptr_t) handle;
+    if (c == NULL) return -1;
+
+    jbyte *in = (*env)->GetPrimitiveArrayCritical(env, inArr, NULL);
+    if (in == NULL) return -1;
+    jbyte *out = (*env)->GetPrimitiveArrayCritical(env, outArr, NULL);
+    if (out == NULL) {
+        (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
+        return -1;
+    }
+
+    const void *inp = (const void *) (in + inOff);
+    uint32_t crc = libdeflate_crc32(0, inp, (size_t) inLen);
+    size_t rc = libdeflate_deflate_compress_nonfinal(
+            c, inp, (size_t) inLen, (void *) (out + outOff), (size_t) outCap);
+
+    (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
+    (*env)->ReleasePrimitiveArrayCritical(env, inArr, in, JNI_ABORT);
+    pzip_set_crc_out(env, crcOut, crc);
+    return (rc == 0) ? -1 : (jint) rc;
+}
+
+/*
+ * Plain C symbols for JDK 22+ FFM Linker (zero JNI overhead / zero GC array pinning).
+ */
+PZIP_EXPORT void *pzip_alloc_compressor(int level) {
+    if (level < 1) level = 1;
+    if (level > 12) level = 12;
+    return (void *) libdeflate_alloc_compressor(level);
+}
+
+PZIP_EXPORT void pzip_free_compressor(void *c) {
+    if (c != NULL) libdeflate_free_compressor((struct libdeflate_compressor *) c);
+}
+
+PZIP_EXPORT int32_t pzip_deflate_mem(void *c, const void *in, size_t in_len,
+                                     void *out, size_t out_cap, uint32_t *crc_out) {
+    if (c == NULL || in == NULL || out == NULL) return -1;
+    uint32_t crc = libdeflate_crc32(0, in, in_len);
+    if (crc_out != NULL) *crc_out = crc;
+    return (int32_t) pzip_compress_or_store((struct libdeflate_compressor *) c, in, in_len, out, out_cap);
+}
+
+PZIP_EXPORT uint32_t pzip_crc32(uint32_t crc, const void *in, size_t in_len) {
+    return libdeflate_crc32(crc, in, in_len);
+}
+
+/*
+ * Native positional write (pwrite) from a buffer directly into an archive path at offset,
+ * used by zero-copy native pwrite paths.
+ */
+PZIP_EXPORT int32_t pzip_pwrite_path(const char *path, const void *buf, size_t len, uint64_t offset) {
+    if (path == NULL || buf == NULL) return -1;
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wlen <= 0) return -1;
+    wchar_t *wpath = (wchar_t *) malloc((size_t) wlen * sizeof(wchar_t));
+    if (wpath == NULL) return -1;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+    HANDLE h = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const uint8_t *p = (const uint8_t *) buf;
+    size_t rem = len;
+    uint64_t off = offset;
+    while (rem > 0) {
+        DWORD chunk = (rem > 0x40000000u) ? 0x40000000u : (DWORD) rem;
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD) (off & 0xFFFFFFFFu);
+        ov.OffsetHigh = (DWORD) (off >> 32);
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, &ov) || written == 0) {
+            CloseHandle(h);
+            return -1;
+        }
+        p += written;
+        off += written;
+        rem -= written;
+    }
+    CloseHandle(h);
+    return 0;
+#else
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    const uint8_t *p = (const uint8_t *) buf;
+    size_t rem = len;
+    off_t off = (off_t) offset;
+    while (rem > 0) {
+        ssize_t w = pwrite(fd, p, rem, off);
+        if (w <= 0) {
+            close(fd);
+            return -1;
+        }
+        p += (size_t) w;
+        off += (off_t) w;
+        rem -= (size_t) w;
+    }
+    close(fd);
+    return 0;
+#endif
 }
