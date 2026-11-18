@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -199,14 +200,13 @@ public final class ParallelZipWriter {
         List<Entry> entries = enumerate(sources, preserveTimestamps);
         long enumerateMs = (System.nanoTime() - t0) / 1_000_000L;
 
-        Path spillDir = Files.createTempDirectory(prepareParent(out), ".pzip-");
-        try {
-            Result r = writeEntries(entries, out, store, skipAlreadyCompressed, level, threads, forceZip64,
+        try (LazySpillDir spillDir = new LazySpillDir(prepareParent(out))) {
+            Sink sink = new Sink(out, store, skipAlreadyCompressed, level, threads, forceZip64,
                     spillThreshold, spillDir);
+            for (Entry e : entries) sink.add(e);
+            Result r = sink.finish();
             return new Result(r.archiveSize(), r.entryCount(), r.rawBytes(), r.storedBytes(),
                     enumerateMs, r.compressWriteMs(), r.zip64());
-        } finally {
-            deleteRecursively(spillDir);
         }
     }
 
@@ -214,6 +214,44 @@ public final class ParallelZipWriter {
         Path parent = out.toAbsolutePath().getParent();
         Files.createDirectories(parent);
         return parent;
+    }
+
+    /** Thread-safe lazy temporary spill directory: only created on disk if an entry actually spills. */
+    static final class LazySpillDir implements Supplier<Path>, AutoCloseable {
+        private final Path parent;
+        private volatile Path dir;
+
+        LazySpillDir(Path parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public Path get() {
+            Path d = dir;
+            if (d != null) return d;
+            synchronized (this) {
+                d = dir;
+                if (d == null) {
+                    try {
+                        dir = d = Files.createTempDirectory(parent, ".pzip-");
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+                return d;
+            }
+        }
+
+        @Override
+        public void close() {
+            Path d;
+            synchronized (this) {
+                d = dir;
+            }
+            if (d != null) {
+                deleteRecursively(d);
+            }
+        }
     }
 
     /**
@@ -434,9 +472,8 @@ public final class ParallelZipWriter {
             boolean failed = false;
             long offset = 0;
             ByteBuffer lhScratch = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
-            try (FileChannel outCh = FileChannel.open(out,
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-                 ChannelWriter cw = new ChannelWriter(outCh, 1 << 20)) {
+            byte[] streamBuf = null;
+            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out), 1 << 20)) {
                 while (true) {
                     Item item = queue.take();
                     if (item == POISON_ITEM) break;
@@ -452,9 +489,11 @@ public final class ParallelZipWriter {
                     if (failed || results == null) continue;   // keep draining the queue
                     for (Compressed c : results) {
                         long localOffset = offset;
-                        lhScratch = writeLocalHeader(cw, lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
-                        int lhLen = lhScratch.remaining();
-                        writePayload(cw, c);
+                        int lhLen = writeLocalHeader(os, lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
+                        if (c.data == null && streamBuf == null) {
+                            streamBuf = new byte[1 << 20];
+                        }
+                        writePayload(os, c, streamBuf);
                         offset += lhLen + c.compSize;
                         order.add(c.e);
                         meta.add(new long[]{c.crc, c.compSize, c.rawSize, c.method, localOffset});
@@ -463,8 +502,7 @@ public final class ParallelZipWriter {
                 }
                 if (!failed) {
                     byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
-                    cw.write(tail, 0, tail.length);
-                    cw.flush();
+                    os.write(tail);
                     archiveSize = offset + tail.length;
                     entryCount = order.size();
                 }
@@ -494,82 +532,19 @@ public final class ParallelZipWriter {
         }
     }
 
-    private static final class ChannelWriter implements AutoCloseable {
-        private final FileChannel ch;
-        private final byte[] buf;
-        private final ByteBuffer bb;
-        private int pos;
-
-        ChannelWriter(FileChannel ch, int cap) {
-            this.ch = ch;
-            this.buf = new byte[cap];
-            this.bb = ByteBuffer.wrap(buf);
-        }
-
-        void write(byte[] src, int off, int len) throws IOException {
-            if (len == 0) return;
-            if (len <= buf.length - pos) {
-                System.arraycopy(src, off, buf, pos, len);
-                pos += len;
-                return;
-            }
-            flush();
-            if (len >= buf.length) {
-                ByteBuffer direct = ByteBuffer.wrap(src, off, len);
-                while (direct.hasRemaining()) ch.write(direct);
-            } else {
-                System.arraycopy(src, off, buf, 0, len);
-                pos = len;
-            }
-        }
-
-        void flush() throws IOException {
-            if (pos == 0) return;
-            bb.position(0).limit(pos);
-            while (bb.hasRemaining()) ch.write(bb);
-            pos = 0;
-        }
-
-        void transferFrom(Path src, long count, String entryName) throws IOException {
-            flush();
-            try (FileChannel in = FileChannel.open(src, StandardOpenOption.READ)) {
-                long p = 0;
-                long rem = count;
-                while (rem > 0) {
-                    long n = in.transferTo(p, rem, ch);
-                    if (n <= 0) {
-                        if (p >= in.size()) throw new IOException("Unexpected EOF streaming " + entryName);
-                        // Fallback if transferTo returns 0 on a non-EOF position
-                        bb.clear();
-                        int max = (int) Math.min(buf.length, rem);
-                        bb.limit(max);
-                        int r = in.read(bb, p);
-                        if (r < 0) throw new IOException("Unexpected EOF streaming " + entryName);
-                        bb.flip();
-                        while (bb.hasRemaining()) ch.write(bb);
-                        p += r;
-                        rem -= r;
-                    } else {
-                        p += n;
-                        rem -= n;
-                    }
-                }
-            }
-        }
-
-        @Override
-        public void close() throws IOException {
-            flush();
-        }
-    }
-
-    private static void writePayload(ChannelWriter cw, Compressed c) throws IOException {
+    private static void writePayload(OutputStream os, Compressed c, byte[] buf) throws IOException {
         if (c.data != null) {
-            cw.write(c.data, 0, (int) c.compSize);
+            os.write(c.data, 0, (int) c.compSize);
             return;
         }
-        try {
-            cw.transferFrom(c.streamFrom, c.compSize, c.e.name);
+        try (InputStream in = Files.newInputStream(c.streamFrom)) {
+            long remaining = c.compSize;
+            while (remaining > 0) {
+                int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
+                if (n < 0) throw new IOException("Unexpected EOF streaming " + c.e.name);
+                os.write(buf, 0, n);
+                remaining -= n;
+            }
         } finally {
             if (c.streamIsTemp) Files.deleteIfExists(c.streamFrom);
         }
@@ -811,9 +786,9 @@ public final class ParallelZipWriter {
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
         if (nativeHandle != 0 && e.size <= mmapThreshold) {
-            // Skip Java-side looksIncompressible here: tryMmapNativeDeflate runs the exact same
-            // 64 KiB sniff natively in pzip_compress_or_store without opening the file again or
-            // allocating a JDK Deflater.
+            // Skip Java-side looksIncompressible here: tryMmapNativeDeflate runs the 64 KiB
+            // sniff natively via sniffIncompressibleDirect (before allocating the output byte[])
+            // and computes CRC-32 with libdeflate over the mapped view.
             Compressed viaMmap = tryMmapNativeDeflate(e, nativeHandle);
             if (viaMmap != null) return viaMmap;
             // fell through: mmap or the native call failed for some reason, stream via the
@@ -850,9 +825,13 @@ public final class ParallelZipWriter {
         try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
             if (ch.size() != e.size) return null; // file changed since it was enumerated
             mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            long[] crcOut = new long[1];
+            if (size >= SNIFF_MIN_INPUT
+                    && LibdeflateNative.sniffIncompressibleDirect(nativeHandle, mapped, size, crcOut)) {
+                return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
+            }
             int cap = size + (size >> 12) + 64;
             byte[] out = new byte[cap];
-            long[] crcOut = new long[1];
             int n = LibdeflateNative.compressDirect(nativeHandle, mapped, size, out, 0, cap, crcOut);
             if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= size)) {
                 // sniff judged it already-compressed, or deflate didn't help: stream the
@@ -1122,16 +1101,14 @@ public final class ParallelZipWriter {
         return (mode << 16) | dos;
     }
 
-    private static ByteBuffer writeLocalHeader(ChannelWriter cw, ByteBuffer b, Entry e, long crc,
-                                               long compSize, long rawSize, int method, boolean force) throws IOException {
+    private static int writeLocalHeader(OutputStream os, ByteBuffer scratch, Entry e, long crc,
+                                        long compSize, long rawSize, int method, boolean force) throws IOException {
         boolean z64 = force || compSize >= MAX32 || rawSize >= MAX32;
         int extraLen = z64 ? 20 : 0; // id(2)+size(2)+uncompressed(8)+compressed(8)
         int needed = 30 + e.nameBytes.length + extraLen;
-        if (b.capacity() < needed) {
-            b = ByteBuffer.allocate(needed).order(ByteOrder.LITTLE_ENDIAN);
-        } else {
-            b.clear();
-        }
+        ByteBuffer b = scratch.capacity() >= needed
+                ? scratch.clear()
+                : ByteBuffer.allocate(needed).order(ByteOrder.LITTLE_ENDIAN);
         b.putInt(LFH_SIG);
         b.putShort((short) (z64 ? 45 : 20));       // version needed
         b.putShort((short) FLAG_UTF8);
@@ -1150,9 +1127,8 @@ public final class ParallelZipWriter {
             b.putLong(rawSize);                    // original size
             b.putLong(compSize);                   // compressed size
         }
-        b.flip();
-        cw.write(b.array(), 0, b.remaining());
-        return b;
+        os.write(b.array(), 0, needed);
+        return needed;
     }
 
     /** Builds the central directory plus the (ZIP64) end-of-central-directory records. */

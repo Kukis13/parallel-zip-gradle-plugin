@@ -96,6 +96,16 @@ public final class LibdeflateNative {
     public static native int compressDirect(long handle, ByteBuffer in, int inLen,
                                              byte[] out, int outOff, int outCap, long[] crcOut);
 
+    /**
+     * Probes the first 64 KiB of a direct {@code ByteBuffer} for incompressibility using a
+     * native stack buffer, before the caller allocates a full-size heap output {@code byte[]}.
+     * When the probe indicates the entry is incompressible, computes the full-buffer CRC-32 into
+     * {@code crcOut[0]} and returns {@code true} so the caller can STORE the entry with zero
+     * Java heap allocation.
+     */
+    public static native boolean sniffIncompressibleDirect(long handle, ByteBuffer in, int inLen,
+                                                           long[] crcOut);
+
     private static boolean load() {
         try {
             String resource = resourcePath();

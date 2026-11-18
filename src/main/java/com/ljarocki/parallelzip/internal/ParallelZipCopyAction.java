@@ -62,28 +62,12 @@ public final class ParallelZipCopyAction implements CopyAction {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-        final Path[] lazySpillDir = new Path[1];
-        final Object spillLock = new Object();
-        java.util.function.Supplier<Path> spillDirSupplier = () -> {
-            Path dir = lazySpillDir[0];
-            if (dir != null) return dir;
-            synchronized (spillLock) {
-                if (lazySpillDir[0] == null) {
-                    try {
-                        lazySpillDir[0] = Files.createTempDirectory(spillParent, ".pzip-");
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                }
-                return lazySpillDir[0];
-            }
-        };
-        try {
+        try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
             ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
-                    archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDirSupplier);
+                    archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir);
             stream.process(details -> {
                 try {
-                    sink.add(toEntry(details, spillDirSupplier));
+                    sink.add(toEntry(details, spillDir));
                 } catch (IOException ex) {
                     throw new UncheckedIOException(ex);
                 } catch (InterruptedException ex) {
@@ -96,10 +80,6 @@ public final class ParallelZipCopyAction implements CopyAction {
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new RuntimeException("parallel-zip archive failed", ex);
-        } finally {
-            if (lazySpillDir[0] != null) {
-                ParallelZipWriter.deleteRecursively(lazySpillDir[0]);
-            }
         }
     }
 
