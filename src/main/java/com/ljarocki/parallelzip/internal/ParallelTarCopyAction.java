@@ -14,6 +14,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
 
 /**
  * Bridges Gradle's {@code CopyActionProcessingStream} to {@link ParallelTarWriter},
@@ -28,9 +29,16 @@ public final class ParallelTarCopyAction implements CopyAction {
     private final int blockSizeBytes;
     private final boolean preserveTimestamps;
     private final long spillThreshold;
+    private final ExecutorService sharedPool;
 
     public ParallelTarCopyAction(Path archive, boolean gzip, int level, int threads,
                                  int blockSizeBytes, boolean preserveTimestamps, long spillThreshold) {
+        this(archive, gzip, level, threads, blockSizeBytes, preserveTimestamps, spillThreshold, null);
+    }
+
+    public ParallelTarCopyAction(Path archive, boolean gzip, int level, int threads,
+                                 int blockSizeBytes, boolean preserveTimestamps, long spillThreshold,
+                                 ExecutorService sharedPool) {
         this.archive = archive;
         this.gzip = gzip;
         this.level = level;
@@ -38,6 +46,7 @@ public final class ParallelTarCopyAction implements CopyAction {
         this.blockSizeBytes = blockSizeBytes;
         this.preserveTimestamps = preserveTimestamps;
         this.spillThreshold = spillThreshold;
+        this.sharedPool = sharedPool;
     }
 
     @Override
@@ -50,7 +59,7 @@ public final class ParallelTarCopyAction implements CopyAction {
         }
         try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent);
              ParallelTarWriter.Sink sink = new ParallelTarWriter.Sink(
-                     archive, gzip, level, threads, blockSizeBytes)) {
+                     archive, gzip, level, threads, blockSizeBytes, sharedPool)) {
             stream.process(details -> {
                 try {
                     sink.add(toEntry(details, spillDir));

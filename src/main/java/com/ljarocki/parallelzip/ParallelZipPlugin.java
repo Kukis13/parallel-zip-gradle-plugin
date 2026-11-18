@@ -2,6 +2,7 @@ package com.ljarocki.parallelzip;
 
 import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
 import com.ljarocki.parallelzip.internal.ParallelZipFastPath;
+import com.ljarocki.parallelzip.internal.ParallelZipPoolService;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.Action;
 import org.gradle.api.Plugin;
@@ -47,19 +48,29 @@ public class ParallelZipPlugin implements Plugin<Project> {
         Provider<Integer> level = extension.getLevel();
         Provider<Integer> threads = extension.getThreads();
 
+        Provider<ParallelZipPoolService> poolService = project.getGradle().getSharedServices()
+                .registerIfAbsent("parallelZipPool", ParallelZipPoolService.class,
+                        spec -> spec.getParameters().getMaxThreads().set(threads));
+
         project.getTasks().withType(ParallelZip.class).configureEach(task -> {
             task.getSkipAlreadyCompressed().convention(skip);
             task.getLevel().convention(level);
             task.getThreads().convention(threads);
+            task.getPoolService().convention(poolService);
+            task.usesService(poolService);
         });
         project.getTasks().withType(ParallelJar.class).configureEach(task -> {
             task.getSkipAlreadyCompressed().convention(skip);
             task.getLevel().convention(level);
             task.getThreads().convention(threads);
+            task.getPoolService().convention(poolService);
+            task.usesService(poolService);
         });
         project.getTasks().withType(ParallelTar.class).configureEach(task -> {
             task.getLevel().convention(level);
             task.getThreads().convention(threads);
+            task.getPoolService().convention(poolService);
+            task.usesService(poolService);
         });
 
         project.afterEvaluate(p -> {
@@ -71,7 +82,7 @@ public class ParallelZipPlugin implements Plugin<Project> {
                 if (zip instanceof Jar || !filter.isSatisfiedBy(zip)) {
                     return;
                 }
-                accelerateZipTask(zip, skip, level, threads);
+                accelerateZipTask(zip, skip, level, threads, poolService);
             });
         });
     }
@@ -79,7 +90,8 @@ public class ParallelZipPlugin implements Plugin<Project> {
     private static void accelerateZipTask(Zip zip,
                                           Provider<Boolean> skipAlreadyCompressed,
                                           Provider<Integer> level,
-                                          Provider<Integer> threads) {
+                                          Provider<Integer> threads,
+                                          Provider<ParallelZipPoolService> poolService) {
         List<Action<? super Task>> actions = zip.getActions();
         int copyActionIndex = -1;
         for (int i = 0; i < actions.size(); i++) {
@@ -99,8 +111,9 @@ public class ParallelZipPlugin implements Plugin<Project> {
         // Threads is intentionally excluded since it does not change output bytes.
         zip.getInputs().property("parallelZip.skipAlreadyCompressed", skipAlreadyCompressed);
         zip.getInputs().property("parallelZip.level", level);
+        zip.usesService(poolService);
 
-        actions.set(copyActionIndex, new AcceleratedZipAction(skipAlreadyCompressed, level, threads));
+        actions.set(copyActionIndex, new AcceleratedZipAction(skipAlreadyCompressed, level, threads, poolService));
     }
 
     /**
@@ -112,13 +125,16 @@ public class ParallelZipPlugin implements Plugin<Project> {
         private final Provider<Boolean> skipAlreadyCompressed;
         private final Provider<Integer> level;
         private final Provider<Integer> threads;
+        private final Provider<ParallelZipPoolService> poolService;
 
         AcceleratedZipAction(Provider<Boolean> skipAlreadyCompressed,
                              Provider<Integer> level,
-                             Provider<Integer> threads) {
+                             Provider<Integer> threads,
+                             Provider<ParallelZipPoolService> poolService) {
             this.skipAlreadyCompressed = skipAlreadyCompressed;
             this.level = level;
             this.threads = threads;
+            this.poolService = poolService;
         }
 
         @Override
@@ -130,8 +146,9 @@ public class ParallelZipPlugin implements Plugin<Project> {
             int lvl = level.get();
             int threadCount = Math.max(1, threads.get());
             boolean preserveTimestamps = zip.isPreserveFileTimestamps();
+            var pool = poolService.get().getExecutor();
 
-            if (ParallelZipFastPath.tryExecute(zip, store, skip, lvl, threadCount)) {
+            if (ParallelZipFastPath.tryExecute(zip, store, skip, lvl, threadCount, pool)) {
                 zip.setDidWork(true);
                 return;
             }
@@ -143,7 +160,9 @@ public class ParallelZipPlugin implements Plugin<Project> {
                     lvl,
                     threadCount,
                     preserveTimestamps,
-                    ParallelZipWriter.SPILL_THRESHOLD);
+                    ParallelZipWriter.SPILL_THRESHOLD,
+                    false,
+                    pool);
 
             CopyActionExecuter executer = createCopyActionExecuter(zip);
             WorkResult result = executer.execute(zip.getRootSpec(), copyAction);

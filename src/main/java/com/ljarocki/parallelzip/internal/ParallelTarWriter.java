@@ -81,13 +81,18 @@ public final class ParallelTarWriter {
         private boolean finished;
 
         public Sink(Path archive, boolean gzip, int level, int threads, int blockSizeBytes) throws IOException {
+            this(archive, gzip, level, threads, blockSizeBytes, null);
+        }
+
+        public Sink(Path archive, boolean gzip, int level, int threads, int blockSizeBytes,
+                    ExecutorService sharedPool) throws IOException {
             Path parent = archive.toAbsolutePath().getParent();
             if (parent != null) Files.createDirectories(parent);
             OutputStream fileOut = new BufferedOutputStream(Files.newOutputStream(archive), 1 << 20);
             if (gzip) {
                 int lvl = (level < 0) ? 6 : Math.max(1, Math.min(12, level));
                 this.out = new BlockGzipOutputStream(fileOut, lvl, Math.max(1, threads),
-                        Math.max(64 * 1024, blockSizeBytes));
+                        Math.max(64 * 1024, blockSizeBytes), sharedPool);
             } else {
                 this.out = fileOut;
             }
@@ -246,29 +251,30 @@ public final class ParallelTarWriter {
         private final int level;
         private final int blockSize;
         private final ExecutorService pool;
+        private final boolean ownsPool;
         private final Semaphore inFlight;
         private final Queue<Future<byte[]>> pending = new ArrayDeque<>();
+        private final java.util.concurrent.ConcurrentHashMap<Thread, Long> nativeHandles =
+                new java.util.concurrent.ConcurrentHashMap<>();
         private final ConcurrentLinkedQueue<Long> allocatedHandles = new ConcurrentLinkedQueue<>();
-        private final ThreadLocal<long[]> nativeHandle;
 
         private byte[] buf;
         private int pos;
         private boolean closed;
 
-        BlockGzipOutputStream(OutputStream target, int level, int threads, int blockSize) {
+        BlockGzipOutputStream(OutputStream target, int level, int threads, int blockSize, ExecutorService sharedPool) {
             this.target = target;
             this.level = level;
             this.blockSize = blockSize;
-            this.pool = Executors.newFixedThreadPool(threads);
+            if (sharedPool != null) {
+                this.pool = sharedPool;
+                this.ownsPool = false;
+            } else {
+                this.pool = Executors.newFixedThreadPool(threads);
+                this.ownsPool = true;
+            }
             this.inFlight = new Semaphore(threads * 2);
             this.buf = new byte[blockSize];
-            this.nativeHandle = ThreadLocal.withInitial(() -> {
-                long h = LibdeflateNative.available() ? LibdeflateNative.allocCompressor(level) : 0L;
-                if (h != 0L) {
-                    allocatedHandles.add(h);
-                }
-                return new long[]{h};
-            });
         }
 
         @Override
@@ -345,7 +351,13 @@ public final class ParallelTarWriter {
         }
 
         private byte[] compressGzipMember(byte[] in, int len) {
-            long handle = nativeHandle.get()[0];
+            long handle = nativeHandles.computeIfAbsent(Thread.currentThread(), t -> {
+                long h = LibdeflateNative.available() ? LibdeflateNative.allocCompressor(level) : 0L;
+                if (h != 0L) {
+                    allocatedHandles.add(h);
+                }
+                return h;
+            });
             if (handle != 0L) {
                 byte[] out = new byte[10 + len + (len >>> 10) + 64 + 8];
                 long[] crcOut = new long[1];
@@ -437,15 +449,18 @@ public final class ParallelTarWriter {
                     writeFuture(pending.poll());
                 }
             } finally {
-                pool.shutdown();
-                try {
-                    if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+                if (ownsPool) {
+                    pool.shutdown();
+                    try {
+                        if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+                            pool.shutdownNow();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                         pool.shutdownNow();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    pool.shutdownNow();
                 }
+                nativeHandles.clear();
                 for (Long h : allocatedHandles) {
                     LibdeflateNative.freeCompressor(h);
                 }

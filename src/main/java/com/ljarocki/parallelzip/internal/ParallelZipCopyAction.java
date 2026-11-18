@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 
 /**
  * Bridges Gradle's copy pipeline to {@link ParallelZipWriter}. Gradle resolves the whole
@@ -45,14 +46,22 @@ public final class ParallelZipCopyAction implements CopyAction {
     private final boolean preserveTimestamps;
     private final long spillThreshold;
     private final boolean pinManifestFirst;
+    private final ExecutorService sharedPool;
 
     public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                                  boolean preserveTimestamps, long spillThreshold) {
-        this(archive, store, skipAlreadyCompressed, level, threads, preserveTimestamps, spillThreshold, false);
+        this(archive, store, skipAlreadyCompressed, level, threads, preserveTimestamps, spillThreshold, false, null);
     }
 
     public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                                  boolean preserveTimestamps, long spillThreshold, boolean pinManifestFirst) {
+        this(archive, store, skipAlreadyCompressed, level, threads, preserveTimestamps, spillThreshold,
+                pinManifestFirst, null);
+    }
+
+    public ParallelZipCopyAction(Path archive, boolean store, boolean skipAlreadyCompressed, int level, int threads,
+                                 boolean preserveTimestamps, long spillThreshold, boolean pinManifestFirst,
+                                 ExecutorService sharedPool) {
         this.archive = archive;
         this.store = store;
         this.skipAlreadyCompressed = skipAlreadyCompressed;
@@ -61,6 +70,7 @@ public final class ParallelZipCopyAction implements CopyAction {
         this.preserveTimestamps = preserveTimestamps;
         this.spillThreshold = spillThreshold;
         this.pinManifestFirst = pinManifestFirst;
+        this.sharedPool = sharedPool;
     }
 
     @Override
@@ -73,7 +83,7 @@ public final class ParallelZipCopyAction implements CopyAction {
         }
         try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
             ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
-                    archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir);
+                    archive, store, skipAlreadyCompressed, level, threads, false, spillThreshold, spillDir, sharedPool);
             if (!pinManifestFirst) {
                 stream.process(details -> addEntry(sink, toEntrySafe(details, spillDir)));
             } else {

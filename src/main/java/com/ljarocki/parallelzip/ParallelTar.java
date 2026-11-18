@@ -2,6 +2,7 @@ package com.ljarocki.parallelzip;
 
 import com.ljarocki.parallelzip.internal.ParallelTarCopyAction;
 import com.ljarocki.parallelzip.internal.ParallelTarWriter;
+import com.ljarocki.parallelzip.internal.ParallelZipPoolService;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.provider.Property;
@@ -43,6 +44,10 @@ public abstract class ParallelTar extends AbstractArchiveTask {
     @Internal
     public abstract Property<Integer> getThreads();
 
+    /** Shared build-wide worker pool service (wired by {@link ParallelZipPlugin}). */
+    @Internal
+    public abstract Property<ParallelZipPoolService> getPoolService();
+
     public ParallelTar() {
         getGzip().convention(false);
         getLevel().convention(-1);
@@ -56,6 +61,7 @@ public abstract class ParallelTar extends AbstractArchiveTask {
     @Override
     protected CopyAction createCopyAction() {
         Path out = getArchiveFile().get().getAsFile().toPath();
+        var pool = getPoolService().isPresent() ? getPoolService().get().getExecutor() : null;
         return new ParallelTarCopyAction(
                 out,
                 Boolean.TRUE.equals(getGzip().get()),
@@ -63,6 +69,7 @@ public abstract class ParallelTar extends AbstractArchiveTask {
                 Math.max(1, getThreads().get()),
                 getBlockSizeBytes().get(),
                 isPreserveFileTimestamps(),
-                ParallelZipWriter.SPILL_THRESHOLD);
+                ParallelZipWriter.SPILL_THRESHOLD,
+                pool);
     }
 }

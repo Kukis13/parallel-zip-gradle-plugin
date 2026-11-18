@@ -1,6 +1,7 @@
 package com.ljarocki.parallelzip;
 
 import com.ljarocki.parallelzip.internal.ParallelZipCopyAction;
+import com.ljarocki.parallelzip.internal.ParallelZipPoolService;
 import com.ljarocki.parallelzip.internal.ParallelZipWriter;
 import org.gradle.api.internal.file.copy.CopyAction;
 import org.gradle.api.provider.Property;
@@ -47,6 +48,10 @@ public abstract class ParallelJar extends Jar {
     @Internal
     public abstract Property<Integer> getThreads();
 
+    /** Shared build-wide worker pool service (wired by {@link ParallelZipPlugin}). */
+    @Internal
+    public abstract Property<ParallelZipPoolService> getPoolService();
+
     public ParallelJar() {
         getStore().convention(false);
         getSkipAlreadyCompressed().convention(true);
@@ -59,6 +64,7 @@ public abstract class ParallelJar extends Jar {
         Path out = getArchiveFile().get().getAsFile().toPath();
         boolean store = Boolean.TRUE.equals(getStore().get())
                 || getEntryCompression() == ZipEntryCompression.STORED;
+        var pool = getPoolService().isPresent() ? getPoolService().get().getExecutor() : null;
         return new ParallelZipCopyAction(
                 out,
                 store,
@@ -67,6 +73,7 @@ public abstract class ParallelJar extends Jar {
                 Math.max(1, getThreads().get()),
                 isPreserveFileTimestamps(),
                 ParallelZipWriter.SPILL_THRESHOLD,
-                true);
+                true,
+                pool);
     }
 }

@@ -55,6 +55,15 @@ public final class ParallelZipFastPath {
                                      boolean skipAlreadyCompressed,
                                      int level,
                                      int threads) {
+        return tryExecute(task, store, skipAlreadyCompressed, level, threads, null);
+    }
+
+    public static boolean tryExecute(AbstractArchiveTask task,
+                                     boolean store,
+                                     boolean skipAlreadyCompressed,
+                                     int level,
+                                     int threads,
+                                     ExecutorService sharedPool) {
         CopySpecInternal rootSpec = task.getRootSpec();
         List<DirSource> dirSources = new ArrayList<>();
         List<FileSource> fileSources = new ArrayList<>();
@@ -142,12 +151,12 @@ public final class ParallelZipFastPath {
         try {
             List<ParallelZipWriter.Entry> entries = collectEntries(
                     dirSources, fileSources, preserveTimestamps, reproducibleOrder,
-                    excludeDuplicates.get(), threads);
+                    excludeDuplicates.get(), threads, sharedPool);
             Path spillParent = ParallelZipWriter.prepareParent(archive);
             try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
                 ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
                         archive, store, skipAlreadyCompressed, level, threads,
-                        false, ParallelZipWriter.SPILL_THRESHOLD, spillDir);
+                        false, ParallelZipWriter.SPILL_THRESHOLD, spillDir, sharedPool);
                 for (ParallelZipWriter.Entry entry : entries) {
                     sink.add(entry);
                 }
@@ -180,7 +189,8 @@ public final class ParallelZipFastPath {
                                                                 boolean preserveTimestamps,
                                                                 boolean reproducibleOrder,
                                                                 boolean excludeDuplicates,
-                                                                int threads)
+                                                                int threads,
+                                                                ExecutorService sharedPool)
             throws IOException, InterruptedException {
         List<ParallelZipWriter.Entry> all = new ArrayList<>();
 
@@ -209,8 +219,10 @@ public final class ParallelZipFastPath {
             }
 
             if (threads > 1 && walkTasks.size() > 1) {
-                int poolSize = Math.min(threads, Math.min(walkTasks.size(), 8));
-                ExecutorService pool = Executors.newFixedThreadPool(poolSize);
+                boolean ownsPool = (sharedPool == null);
+                ExecutorService pool = ownsPool
+                        ? Executors.newFixedThreadPool(Math.min(threads, Math.min(walkTasks.size(), 8)))
+                        : sharedPool;
                 try {
                     List<Future<List<ParallelZipWriter.Entry>>> futures = pool.invokeAll(walkTasks);
                     for (Future<List<ParallelZipWriter.Entry>> f : futures) {
@@ -221,7 +233,9 @@ public final class ParallelZipFastPath {
                     if (cause instanceof IOException ioe) throw ioe;
                     throw new RuntimeException(cause);
                 } finally {
-                    pool.shutdown();
+                    if (ownsPool) {
+                        pool.shutdown();
+                    }
                 }
             } else {
                 for (Callable<List<ParallelZipWriter.Entry>> task : walkTasks) {

@@ -281,13 +281,16 @@ public final class ParallelZipWriter {
     public static final class Sink {
         private static final long MIB = 1L << 20;
         private final ExecutorService pool;
-        private final ThreadLocal<Deflater> deflaters;
+        private final boolean ownsPool;
+        private final java.util.concurrent.ConcurrentHashMap<Thread, Deflater> deflaters =
+                new java.util.concurrent.ConcurrentHashMap<>();
         // One native libdeflate compressor per worker thread, reused for every entry that
         // thread compresses (allocating one is real cost -- it sizes match-finder tables --
         // so paying it once per thread beats once per entry). Only allocated when store is
         // false and the native library is loaded; otherwise every thread's handle is 0,
         // which every native call site treats as "unavailable, use the JDK Deflater".
-        private final ThreadLocal<Long> nativeHandles;
+        private final java.util.concurrent.ConcurrentHashMap<Thread, Long> nativeHandles =
+                new java.util.concurrent.ConcurrentHashMap<>();
         private final ConcurrentLinkedQueue<Long> allocatedNativeHandles = new ConcurrentLinkedQueue<>();
         // Mirrors the condition nativeHandles' initializer uses, so permitsFor (called from
         // the producer thread, before any worker thread has touched nativeHandles) can budget
@@ -333,25 +336,29 @@ public final class ParallelZipWriter {
 
         public Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
                     boolean forceZip64, long spillThreshold, Path spillDir) {
-            this(out, store, skipAlreadyCompressed, level, threads, forceZip64, spillThreshold, () -> spillDir);
+            this(out, store, skipAlreadyCompressed, level, threads, forceZip64, spillThreshold, () -> spillDir, null);
         }
 
         Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
              boolean forceZip64, long spillThreshold, Supplier<Path> spillDir) {
+            this(out, store, skipAlreadyCompressed, level, threads, forceZip64, spillThreshold, spillDir, null);
+        }
+
+        Sink(Path out, boolean store, boolean skipAlreadyCompressed, int level, int threads,
+             boolean forceZip64, long spillThreshold, Supplier<Path> spillDir, ExecutorService sharedPool) {
             this.store = store;
             this.skipAlreadyCompressed = skipAlreadyCompressed;
             this.level = level;
             this.spillThreshold = spillThreshold;
             this.spillDir = spillDir;
-            this.pool = Executors.newFixedThreadPool(threads);
-            this.deflaters = ThreadLocal.withInitial(() -> new Deflater(level, true));
+            if (sharedPool != null) {
+                this.pool = sharedPool;
+                this.ownsPool = false;
+            } else {
+                this.pool = Executors.newFixedThreadPool(threads);
+                this.ownsPool = true;
+            }
             this.useNative = !store && LibdeflateNative.available();
-            this.nativeHandles = ThreadLocal.withInitial(() -> {
-                if (!useNative) return 0L;
-                long h = allocNativeCompressor(level);
-                if (h != 0) allocatedNativeHandles.add(h);
-                return h;
-            });
             this.countFlight = new Semaphore(threads * 4);
             // Cap in-memory bytes to a fraction of the heap so entries can't OOM the daemon.
             long maxMemory = Runtime.getRuntime().maxMemory();
@@ -405,8 +412,18 @@ public final class ParallelZipWriter {
             byteFlight.acquire(permits);  // backpressure on memory; released by the writer
             countFlight.acquire();
             Future<List<Compressed>> f =
-                    pool.submit(() -> compressBatch(batch, store, skipAlreadyCompressed, level, deflaters.get(),
-                            nativeHandles.get(), spillThreshold, spillDir, effectiveMmapThreshold));
+                    pool.submit(() -> {
+                        Thread t = Thread.currentThread();
+                        Deflater def = deflaters.computeIfAbsent(t, k -> new Deflater(level, true));
+                        long nh = nativeHandles.computeIfAbsent(t, k -> {
+                            if (!useNative) return 0L;
+                            long h = allocNativeCompressor(level);
+                            if (h != 0) allocatedNativeHandles.add(h);
+                            return h;
+                        });
+                        return compressBatch(batch, store, skipAlreadyCompressed, level, def,
+                                nh, spillThreshold, spillDir, effectiveMmapThreshold);
+                    });
             queue.put(new Item(f, permits));
         }
 
@@ -458,7 +475,14 @@ public final class ParallelZipWriter {
                 // freeing native handles right after is safe, no task can still be using one.
                 writerThread.join();
             } finally {
-                pool.shutdown();
+                if (ownsPool) {
+                    pool.shutdown();
+                }
+                for (Deflater d : deflaters.values()) {
+                    d.end();
+                }
+                deflaters.clear();
+                nativeHandles.clear();
                 for (Long h : allocatedNativeHandles) LibdeflateNative.freeCompressor(h);
             }
             if (writerError != null) throw writerError;
@@ -821,56 +845,28 @@ public final class ParallelZipWriter {
      */
     private static Compressed tryMmapNativeDeflate(Entry e, long nativeHandle) {
         int size = (int) e.size; // safe: caller already checked e.size against the (<=MMAP_THRESHOLD) mmap eligibility cap
-        MappedByteBuffer mapped = null;
         try (FileChannel ch = FileChannel.open(e.file, StandardOpenOption.READ)) {
             if (ch.size() != e.size) return null; // file changed since it was enumerated
-            mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
-            long[] crcOut = new long[1];
-            if (size >= SNIFF_MIN_INPUT
-                    && LibdeflateNative.sniffIncompressibleDirect(nativeHandle, mapped, size, crcOut)) {
-                return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
+            try (MappedFileView view = MappedFileView.open(ch, size)) {
+                ByteBuffer mapped = view.buffer();
+                long[] crcOut = new long[1];
+                if (size >= SNIFF_MIN_INPUT
+                        && LibdeflateNative.sniffIncompressibleDirect(nativeHandle, mapped, size, crcOut)) {
+                    return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
+                }
+                int cap = size + (size >> 12) + 64;
+                byte[] out = new byte[cap];
+                int n = LibdeflateNative.compressDirect(nativeHandle, mapped, size, out, 0, cap, crcOut);
+                if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= size)) {
+                    // sniff judged it already-compressed, or deflate didn't help: stream the
+                    // original file as STORE instead of materializing it into a byte[].
+                    return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
+                }
+                if (n <= 0) return null; // real failure: caller uses the streaming JDK Deflater
+                return new Compressed(e, out, null, false, crcOut[0], e.size, n, 8);
             }
-            int cap = size + (size >> 12) + 64;
-            byte[] out = new byte[cap];
-            int n = LibdeflateNative.compressDirect(nativeHandle, mapped, size, out, 0, cap, crcOut);
-            if (n == LibdeflateNative.STORE_SENTINEL || (n > 0 && n >= size)) {
-                // sniff judged it already-compressed, or deflate didn't help: stream the
-                // original file as STORE instead of materializing it into a byte[].
-                return new Compressed(e, null, e.file, e.fileIsTemp, crcOut[0], e.size, e.size, 0);
-            }
-            if (n <= 0) return null; // real failure: caller uses the streaming JDK Deflater
-            return new Compressed(e, out, null, false, crcOut[0], e.size, n, 8);
         } catch (IOException ex) {
             return null; // mapping failed (e.g. platform limits): caller uses the streaming JDK Deflater
-        } finally {
-            // The native call above is synchronous and fully done reading `mapped` by the time
-            // it returns, on every path (success, sniffed-STORE, or failure) -- none of them
-            // keep a reference to the mapping itself. Release it explicitly now rather than
-            // waiting on GC: on Windows, an unreleased mapping keeps its backing file locked
-            // against deletion or rewrite -- by anyone, including a later task in the same
-            // long-lived Gradle daemon -- until the buffer is finalized, which is not bounded.
-            unmap(mapped);
-        }
-    }
-
-    /**
-     * Best-effort explicit release of a direct buffer's OS-level mapping via
-     * {@code sun.misc.Unsafe#invokeCleaner}, in place of waiting for ordinary GC finalization.
-     * A no-op (mapping falls back to GC-driven cleanup, same as before this method existed) if
-     * {@code buffer} is null or {@code Unsafe} internals aren't accessible on the running JVM.
-     */
-    private static void unmap(MappedByteBuffer buffer) {
-        if (buffer == null) return;
-        try {
-            Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
-            Field theUnsafe = unsafeClass.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            Object unsafe = theUnsafe.get(null);
-            Method invokeCleaner = unsafeClass.getMethod("invokeCleaner", ByteBuffer.class);
-            invokeCleaner.invoke(unsafe, buffer);
-        } catch (Throwable ignored) {
-            // Fall back silently: the mapping is still released eventually, just on GC's
-            // schedule instead of immediately.
         }
     }
 
