@@ -106,8 +106,20 @@ class ParallelZipWriterBatchingTest {
         ParallelZipWriter.write(sources, out16, false, -1, 16, false);
 
         String sha1 = sha256(out1);
-        assertEquals(sha1, sha256(out8), "1 vs 8 threads must be byte-identical with batching");
-        assertEquals(sha1, sha256(out16), "1 vs 16 threads must be byte-identical with batching");
+        for (var pair : List.of(Map.entry("8", out8), Map.entry("16", out16))) {
+            String shaN = sha256(pair.getValue());
+            if (!sha1.equals(shaN)) {
+                String diff = ZipDiff.compare(out1, pair.getValue(), true).formatReport(out1, pair.getValue(), 20);
+                byte[] b1 = Files.readAllBytes(out1);
+                byte[] bN = Files.readAllBytes(pair.getValue());
+                int firstDiff = -1;
+                for (int i = 0; i < Math.min(b1.length, bN.length); i++) {
+                    if (b1[i] != bN[i]) { firstDiff = i; break; }
+                }
+                assertEquals(sha1, shaN, "1 vs " + pair.getKey() + " threads mismatch (len1=" + b1.length
+                        + " lenN=" + bN.length + " firstDiff=" + firstDiff + "):\n" + diff);
+            }
+        }
     }
 
     private static String sha256(Path file) throws Exception {

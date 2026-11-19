@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include <jni.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -11,6 +17,7 @@
 #include <windows.h>
 #define PZIP_EXPORT __declspec(dllexport)
 #else
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #define PZIP_EXPORT __attribute__((visibility("default")))
@@ -575,6 +582,9 @@ PZIP_EXPORT int32_t pzip_pwrite_path(const char *path, const void *buf, size_t l
     off_t off = (off_t) offset;
     while (rem > 0) {
         ssize_t w = pwrite(fd, p, rem, off);
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
         if (w <= 0) {
             close(fd);
             return -1;

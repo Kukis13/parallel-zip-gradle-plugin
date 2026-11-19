@@ -3922,6 +3922,7 @@ libdeflate_alloc_compressor_ex(int compression_level,
 	 * compress very small inputs.
 	 */
 	c->max_passthrough_size = 55 - (compression_level * 4);
+	c->pzip_nonfinal = false;
 
 	switch (compression_level) {
 	case 0:
@@ -4049,6 +4050,7 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
 	os.overflow = false;
 
 	/* Call the actual compression function. */
+	c->pzip_nonfinal = false;
 	(*c->impl)(c, in, in_nbytes, &os);
 
 	/* Return 0 if the output buffer is too small. */
@@ -4078,12 +4080,13 @@ libdeflate_deflate_compress_nonfinal(struct libdeflate_compressor *c,
 	struct deflate_output_bitstream os;
 
 	if (unlikely(in_nbytes <= c->max_passthrough_size)) {
-		/* Fall back to standard stored blocks with BFINAL=0 + trailing empty stored block. */
-		if (out_nbytes_avail < in_nbytes + 10)
-			return 0;
 		u8 *p = (u8 *)out;
 		size_t rem = in_nbytes;
 		const u8 *src = (const u8 *)in;
+
+		/* Fall back to standard stored blocks with BFINAL=0 + trailing empty stored block. */
+		if (out_nbytes_avail < in_nbytes + 10)
+			return 0;
 		do {
 			u16 chunk = (u16)MIN(rem, UINT16_MAX);
 			*p++ = 0x00; /* BFINAL=0, BTYPE=00 */

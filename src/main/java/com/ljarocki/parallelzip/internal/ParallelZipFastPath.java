@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -152,6 +153,9 @@ public final class ParallelZipFastPath {
             List<ParallelZipWriter.Entry> entries = collectEntries(
                     dirSources, fileSources, preserveTimestamps, reproducibleOrder,
                     excludeDuplicates.get(), threads, sharedPool);
+            if (entries == null) {
+                return false; // Symlink encountered; fall back to Gradle's CopyActionExecuter.
+            }
             Path spillParent = ParallelZipWriter.prepareParent(archive);
             try (ParallelZipWriter.LazySpillDir spillDir = new ParallelZipWriter.LazySpillDir(spillParent)) {
                 ParallelZipWriter.Sink sink = new ParallelZipWriter.Sink(
@@ -214,7 +218,9 @@ public final class ParallelZipFastPath {
         List<ParallelZipWriter.Entry> all = new ArrayList<>();
 
         for (FileSource fs : fileSources) {
-            BasicFileAttributes attrs = Files.readAttributes(fs.file(), BasicFileAttributes.class);
+            BasicFileAttributes attrs = Files.readAttributes(
+                    fs.file(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attrs.isSymbolicLink()) return null;
             all.add(toEntry(fs.prefix() + fs.file().getFileName().toString(), fs.file(), false, attrs, preserveTimestamps));
         }
 
@@ -226,7 +232,9 @@ public final class ParallelZipFastPath {
                 if (!Files.exists(base)) continue;
                 try (var stream = Files.list(base)) {
                     for (Path child : stream.toList()) {
-                        BasicFileAttributes attrs = Files.readAttributes(child, BasicFileAttributes.class);
+                        BasicFileAttributes attrs = Files.readAttributes(
+                                child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                        if (attrs.isSymbolicLink()) return null;
                         if (attrs.isDirectory()) {
                             all.add(toEntry(entryName(ds.prefix(), base, child, true), child, true, attrs, preserveTimestamps));
                             walkTasks.add(() -> walkSubtree(ds.prefix(), base, child, preserveTimestamps));
@@ -245,7 +253,9 @@ public final class ParallelZipFastPath {
                 try {
                     List<Future<List<ParallelZipWriter.Entry>>> futures = pool.invokeAll(walkTasks);
                     for (Future<List<ParallelZipWriter.Entry>> f : futures) {
-                        all.addAll(f.get());
+                        List<ParallelZipWriter.Entry> sub = f.get();
+                        if (sub == null) return null;
+                        all.addAll(sub);
                     }
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
@@ -259,7 +269,9 @@ public final class ParallelZipFastPath {
             } else {
                 for (Callable<List<ParallelZipWriter.Entry>> task : walkTasks) {
                     try {
-                        all.addAll(task.call());
+                        List<ParallelZipWriter.Entry> sub = task.call();
+                        if (sub == null) return null;
+                        all.addAll(sub);
                     } catch (IOException e) {
                         throw e;
                     } catch (Exception e) {
@@ -291,9 +303,14 @@ public final class ParallelZipFastPath {
                                                              Path subtreeRoot,
                                                              boolean preserveTimestamps) throws IOException {
         List<ParallelZipWriter.Entry> list = new ArrayList<>();
+        boolean[] sawSymlink = {false};
         Files.walkFileTree(subtreeRoot, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                if (attrs.isSymbolicLink()) {
+                    sawSymlink[0] = true;
+                    return FileVisitResult.TERMINATE;
+                }
                 if (!dir.equals(subtreeRoot)) {
                     list.add(toEntry(entryName(prefix, base, dir, true), dir, true, attrs, preserveTimestamps));
                 }
@@ -302,11 +319,15 @@ public final class ParallelZipFastPath {
 
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (attrs.isSymbolicLink()) {
+                    sawSymlink[0] = true;
+                    return FileVisitResult.TERMINATE;
+                }
                 list.add(toEntry(entryName(prefix, base, file, false), file, false, attrs, preserveTimestamps));
                 return FileVisitResult.CONTINUE;
             }
         });
-        return list;
+        return sawSymlink[0] ? null : list;
     }
 
     private static String entryName(String prefix, Path base, Path p, boolean dir) {

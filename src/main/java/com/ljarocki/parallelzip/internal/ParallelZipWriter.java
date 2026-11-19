@@ -514,6 +514,9 @@ public final class ParallelZipWriter {
             return new Result(archiveSize, entryCount, stats[0], stats[1], 0, ms, usedZip64[0]);
         }
 
+        private static final boolean IS_WINDOWS =
+                System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+
         private void runWriter(Path out, boolean forceZip64) {
             List<Entry> order = new ArrayList<>();
             List<long[]> meta = new ArrayList<>();
@@ -541,8 +544,11 @@ public final class ParallelZipWriter {
                         long localOffset = offset;
                         byte[] lhBytes = buildLocalHeaderBytes(lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
                         int lhLen = lhBytes.length;
-                        if (c.compSize >= (256L << 10)) {
+                        if (!IS_WINDOWS && c.compSize >= (256L << 10)) {
                             // Bound concurrent in-flight pwrite buffers so memory stays capped.
+                            // Positional pwrite on a single FileChannel is atomic/concurrent on POSIX;
+                            // on Windows synchronous handles, keep writes on writerThread to avoid
+                            // kernel OVERLAPPED/EOF races.
                             if (pwriteFutures.size() >= 16) {
                                 drainPwriteFutures(pwriteFutures, false);
                             }
@@ -565,6 +571,13 @@ public final class ParallelZipWriter {
                                 writeChannelFully(outChannel, ByteBuffer.wrap(lhBytes), localOffset);
                                 if (c.streamFrom != null) {
                                     pwritePayload(outChannel, c, localOffset + lhLen);
+                                }
+                            } else if (lhLen + c.compSize > stage.capacity()) {
+                                offset = flushStage(outChannel, stage, offset);
+                                writeChannelFully(outChannel, ByteBuffer.wrap(lhBytes), localOffset);
+                                if (c.compSize > 0) {
+                                    writeChannelFully(outChannel, ByteBuffer.wrap(c.data, 0, (int) c.compSize),
+                                            localOffset + lhLen);
                                 }
                             } else {
                                 if (stage.remaining() < lhLen + c.compSize) {
