@@ -140,7 +140,7 @@ public final class ParallelTarWriter {
 
         private void writeEntryHeader(Entry entry) throws IOException {
             byte[] nameBytes = entry.name.getBytes(StandardCharsets.UTF_8);
-            boolean needPaxPath = nameBytes.length > 100;
+            boolean needPaxPath = nameBytes.length > 100 || !isAscii(entry.name);
             boolean needPaxSize = !entry.dir && entry.size > MAX_USTAR_SIZE;
             if (needPaxPath || needPaxSize) {
                 ByteArrayOutputStream pax = new ByteArrayOutputStream();
@@ -229,6 +229,13 @@ public final class ParallelTarWriter {
                 }
                 len = actual;
             }
+        }
+
+        private static boolean isAscii(String s) {
+            for (int i = 0; i < s.length(); i++) {
+                if (s.charAt(i) > 0x7F) return false;
+            }
+            return true;
         }
 
         private static String truncateName(String name, int maxBytes) {
@@ -449,6 +456,22 @@ public final class ParallelTarWriter {
                     writeFuture(pending.poll());
                 }
             } finally {
+                // Always await any remaining in-flight tasks before freeing native compressors
+                // (critical when borrowing the shared BuildService pool and an earlier block failed).
+                boolean interrupted = false;
+                while (!pending.isEmpty()) {
+                    Future<byte[]> f = pending.poll();
+                    while (true) {
+                        try {
+                            f.get();
+                            break;
+                        } catch (InterruptedException ie) {
+                            interrupted = true;
+                        } catch (ExecutionException ignored) {
+                            break;
+                        }
+                    }
+                }
                 if (ownsPool) {
                     pool.shutdown();
                     try {
@@ -456,7 +479,7 @@ public final class ParallelTarWriter {
                             pool.shutdownNow();
                         }
                     } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
+                        interrupted = true;
                         pool.shutdownNow();
                     }
                 }
@@ -465,6 +488,9 @@ public final class ParallelTarWriter {
                     LibdeflateNative.freeCompressor(h);
                 }
                 allocatedHandles.clear();
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
                 target.close();
             }
         }

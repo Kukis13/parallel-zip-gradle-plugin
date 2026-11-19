@@ -49,9 +49,13 @@ public class ParallelZipPlugin implements Plugin<Project> {
         Provider<Integer> level = extension.getLevel();
         Provider<Integer> threads = extension.getThreads();
 
+        Provider<Integer> poolMaxThreads = project.getProviders()
+                .gradleProperty("pzip.maxThreads")
+                .map(Integer::parseInt)
+                .orElse(Runtime.getRuntime().availableProcessors());
         Provider<ParallelZipPoolService> poolService = project.getGradle().getSharedServices()
                 .registerIfAbsent("parallelZipPool", ParallelZipPoolService.class,
-                        spec -> spec.getParameters().getMaxThreads().set(threads));
+                        spec -> spec.getParameters().getMaxThreads().set(poolMaxThreads));
 
         project.getTasks().withType(ParallelZip.class).configureEach(task -> {
             task.getSkipAlreadyCompressed().convention(skip);

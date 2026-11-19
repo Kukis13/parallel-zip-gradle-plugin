@@ -134,7 +134,7 @@ public final class ZipPatcher {
             }
         }
 
-        if (reused == 0) {
+        if (reused == 0 || entries.size() >= 0xFFFF) {
             Files.deleteIfExists(tmpNew);
             try {
                 ParallelZipWriter.writeEntries(entries, targetArchive, store, skipAlreadyCompressed, level, threads,
@@ -190,6 +190,19 @@ public final class ZipPatcher {
                     offset += copied;
                 }
 
+                if (needsZip64(cdOut, offsetsOut, offset)) {
+                    // Fall back to full ZIP64-capable writer rather than truncating 64-bit offsets/sizes.
+                    outCh.close();
+                    Files.deleteIfExists(tmpNew);
+                    try {
+                        ParallelZipWriter.writeEntries(entries, targetArchive, store, skipAlreadyCompressed,
+                                level, threads, false, ParallelZipWriter.SPILL_THRESHOLD, null);
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted writing ZIP64 archive", ex);
+                    }
+                    return 0;
+                }
                 writeCentralDirectoryAndEocd(outCh, cdOut, offsetsOut, offset);
             }
             Files.move(tmpNew, targetArchive, StandardCopyOption.REPLACE_EXISTING);
@@ -198,6 +211,21 @@ public final class ZipPatcher {
             Files.deleteIfExists(deltaZip);
             Files.deleteIfExists(tmpNew);
         }
+    }
+
+    private static boolean needsZip64(List<ZipDiff.EntryMeta> entries, List<Long> offsets, long cdOffset) {
+        if (entries.size() >= 0xFFFF || cdOffset >= 0xFFFFFFFFL) return true;
+        long cdSize = 0;
+        for (int i = 0; i < entries.size(); i++) {
+            ZipDiff.EntryMeta m = entries.get(i);
+            if (offsets.get(i) >= 0xFFFFFFFFL
+                    || m.compressedSize() >= 0xFFFFFFFFL
+                    || m.uncompressedSize() >= 0xFFFFFFFFL) {
+                return true;
+            }
+            cdSize += 46L + m.name().getBytes(StandardCharsets.UTF_8).length + m.extra().length;
+        }
+        return cdSize >= 0xFFFFFFFFL;
     }
 
     private static void writeCentralDirectoryAndEocd(FileChannel outCh,

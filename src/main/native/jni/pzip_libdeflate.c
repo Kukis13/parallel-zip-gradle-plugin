@@ -332,6 +332,22 @@ static int pzip_looks_already_compressed(const uint8_t *h, size_t len) {
     }
 }
 
+static FILE *pzip_fopen_utf8_rb(const char *utf8_path) {
+    if (utf8_path == NULL) return NULL;
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    wchar_t *wpath = (wchar_t *) malloc((size_t) wlen * sizeof(wchar_t));
+    if (wpath == NULL) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath, wlen);
+    FILE *fp = _wfopen(wpath, L"rb");
+    free(wpath);
+    return fp;
+#else
+    return fopen(utf8_path, "rb");
+#endif
+}
+
 /*
  * Opens, sniffs, CRCs, and compresses a batch of small/medium files directly in native code,
  * avoiding per-file Java byte[16] header arrays and InputStream wrappers on 20k-file corpora.
@@ -362,6 +378,16 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
 
     size_t scratch_cap = 64u * 1024u;
     uint8_t *scratch = (uint8_t *) malloc(scratch_cap);
+    if (scratch == NULL) {
+        for (jint i = 0; i < count; i++) {
+            outLens[i] = -1;
+            crcs[i] = 0;
+        }
+        (*env)->ReleaseIntArrayElements(env, outLensArr, outLens, 0);
+        (*env)->ReleaseLongArrayElements(env, rawSizesArr, rawSizes, JNI_ABORT);
+        (*env)->ReleaseLongArrayElements(env, crcsArr, crcs, 0);
+        return;
+    }
 
     for (jint i = 0; i < count; i++) {
         outLens[i] = -1;
@@ -387,7 +413,7 @@ JNIEXPORT void JNICALL Java_com_ljarocki_parallelzip_internal_LibdeflateNative_c
         }
 
         const char *cpath = (*env)->GetStringUTFChars(env, jpath, NULL);
-        FILE *fp = (cpath != NULL) ? fopen(cpath, "rb") : NULL;
+        FILE *fp = pzip_fopen_utf8_rb(cpath);
         if (cpath != NULL) (*env)->ReleaseStringUTFChars(env, jpath, cpath);
         (*env)->DeleteLocalRef(env, jpath);
 

@@ -469,15 +469,32 @@ public final class ParallelZipWriter {
         }
 
         public Result finish() throws IOException, InterruptedException {
+            boolean interrupted = false;
             try {
                 flushBatch();
                 queue.put(POISON_ITEM);
-                // The writer thread only reaches POISON after it has already called
-                // future().get() on every real item in submission order, so every
-                // compress task has fully completed by the time join() returns below --
-                // freeing native handles right after is safe, no task can still be using one.
-                writerThread.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
+                // Best-effort poison so writerThread exits and drains all in-flight tasks.
+                while (true) {
+                    try {
+                        queue.put(POISON_ITEM);
+                        break;
+                    } catch (InterruptedException ie) {
+                        interrupted = true;
+                    }
+                }
             } finally {
+                // Always wait for writerThread to finish draining all compression and pwrite
+                // tasks before freeing Deflaters and native libdeflate handles (prevents UAF
+                // on shared BuildService pools).
+                while (writerThread.isAlive()) {
+                    try {
+                        writerThread.join();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
                 if (ownsPool) {
                     pool.shutdown();
                 }
@@ -487,7 +504,11 @@ public final class ParallelZipWriter {
                 deflaters.clear();
                 nativeHandles.clear();
                 for (Long h : allocatedNativeHandles) LibdeflateNative.freeCompressor(h);
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
+            if (interrupted) throw new InterruptedException("Interrupted while finishing archive");
             if (writerError != null) throw writerError;
             long ms = (System.nanoTime() - startNanos) / 1_000_000L;
             return new Result(archiveSize, entryCount, stats[0], stats[1], 0, ms, usedZip64[0]);
@@ -521,6 +542,10 @@ public final class ParallelZipWriter {
                         byte[] lhBytes = buildLocalHeaderBytes(lhScratch, c.e, c.crc, c.compSize, c.rawSize, c.method, forceZip64);
                         int lhLen = lhBytes.length;
                         if (c.compSize >= (256L << 10)) {
+                            // Bound concurrent in-flight pwrite buffers so memory stays capped.
+                            if (pwriteFutures.size() >= 16) {
+                                drainPwriteFutures(pwriteFutures, false);
+                            }
                             offset = flushStage(outChannel, stage, offset);
                             writeChannelFully(outChannel, ByteBuffer.wrap(lhBytes), localOffset);
                             final long dataOffset = localOffset + lhLen;
@@ -559,21 +584,45 @@ public final class ParallelZipWriter {
                 }
                 if (!failed) {
                     flushStageAtCurrentPos(outChannel, stage, offset - stage.position());
-                    for (Future<?> pf : pwriteFutures) {
-                        try {
-                            pf.get();
-                        } catch (Exception ex) {
-                            throw asIO(ex);
-                        }
-                    }
+                    drainPwriteFutures(pwriteFutures, false);
                     byte[] tail = buildCentralDirectoryAndEnd(order, meta, offset, forceZip64, usedZip64);
                     writeChannelFully(outChannel, ByteBuffer.wrap(tail), offset);
                     archiveSize = offset + tail.length;
                     entryCount = order.size();
+                } else {
+                    // Always await in-flight pwrites before outChannel closes.
+                    drainPwriteFutures(pwriteFutures, true);
                 }
             } catch (Exception ex) {
                 if (writerError == null) writerError = asIO(ex);
+            } finally {
+                // Defensive drain in case an exception escaped before the if/else above.
+                try {
+                    drainPwriteFutures(pwriteFutures, true);
+                } catch (IOException ignored) { }
             }
+        }
+
+        private static void drainPwriteFutures(List<Future<?>> futures, boolean ignoreErrors) throws IOException {
+            if (futures.isEmpty()) return;
+            IOException firstErr = null;
+            for (Future<?> pf : futures) {
+                while (true) {
+                    try {
+                        pf.get();
+                        break;
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    } catch (Exception ex) {
+                        if (!ignoreErrors && firstErr == null) {
+                            firstErr = asIO(ex);
+                        }
+                        break;
+                    }
+                }
+            }
+            futures.clear();
+            if (firstErr != null) throw firstErr;
         }
 
         private static long flushStage(FileChannel ch, ByteBuffer stage, long currentOffset) throws IOException {
@@ -853,7 +902,7 @@ public final class ParallelZipWriter {
                 return compressBytes(e, e.inline, store, skipAlreadyCompressed, def, nativeHandle);
             }
             if (e.size > spillThreshold) {
-                return compressLarge(e, store, skipAlreadyCompressed, def, spillDir, nativeHandle, mmapThreshold);
+                return compressLarge(e, store, skipAlreadyCompressed, level, def, spillDir, nativeHandle, mmapThreshold);
             }
             return compressBytes(e, Files.readAllBytes(e.file), store, skipAlreadyCompressed, def, nativeHandle);
         } catch (IOException ex) {
@@ -968,7 +1017,7 @@ public final class ParallelZipWriter {
     static final int SNIFF_KEEP_PCT = 98; // store when the probe compresses to >= this % of its size
 
     /** Streams a large file-backed entry: deflate to a temp, or read/stream the source when stored. */
-    private static Compressed compressLarge(Entry e, boolean store, boolean skipAlreadyCompressed, Deflater def,
+    private static Compressed compressLarge(Entry e, boolean store, boolean skipAlreadyCompressed, int level, Deflater def,
                                             Supplier<Path> spillDir, long nativeHandle, long mmapThreshold) throws IOException {
         if (store || (skipAlreadyCompressed && looksAlreadyCompressed(e.file))) {
             CRC32 crc = new CRC32();
@@ -990,7 +1039,7 @@ public final class ParallelZipWriter {
             return new Compressed(e, null, e.file, e.fileIsTemp, crc.getValue(), e.size, e.size, 0);
         }
         if (e.size > mmapThreshold) {
-            Compressed chunked = tryParallelChunkedDeflate(e, nativeHandle != 0, spillDir);
+            Compressed chunked = tryParallelChunkedDeflate(e, level, nativeHandle != 0, spillDir);
             if (chunked != null) {
                 return chunked;
             }
@@ -1014,12 +1063,14 @@ public final class ParallelZipWriter {
      * stitching the byte-aligned raw DEFLATE streams and combining per-chunk CRCs via
      * {@link #crc32Combine}.
      */
-    private static Compressed tryParallelChunkedDeflate(Entry e, boolean useNative, Supplier<Path> spillDir)
+    private static Compressed tryParallelChunkedDeflate(Entry e, int level, boolean useNative, Supplier<Path> spillDir)
             throws IOException {
         long totalSize = e.size;
         int numChunks = (int) ((totalSize + CHUNKED_BLOCK_BYTES - 1) / CHUNKED_BLOCK_BYTES);
         if (numChunks <= 1) return null;
 
+        int nativeLevel = level < 0 ? 6 : Math.max(1, Math.min(12, level));
+        int jdkLevel = level < 0 ? Deflater.DEFAULT_COMPRESSION : Math.min(9, Math.max(0, level));
         int workers = Math.min(numChunks, Math.min(Runtime.getRuntime().availableProcessors(), 8));
         ExecutorService chunkPool = Executors.newFixedThreadPool(workers);
         Path tmp = Files.createTempFile(spillDir.get(), "e-chunked", ".z");
@@ -1043,7 +1094,7 @@ public final class ParallelZipWriter {
                         }
                     }
                     if (useNative) {
-                        long h = LibdeflateNative.allocCompressor(6);
+                        long h = LibdeflateNative.allocCompressor(nativeLevel);
                         if (h != 0L) {
                             try {
                                 byte[] outBuf = new byte[len + (len >> 10) + 64];
@@ -1061,7 +1112,7 @@ public final class ParallelZipWriter {
                     }
                     CRC32 c = new CRC32();
                     c.update(raw, 0, len);
-                    Deflater d = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+                    Deflater d = new Deflater(jdkLevel, true);
                     try {
                         d.setInput(raw, 0, len);
                         ByteArrayOutputStream baos = new ByteArrayOutputStream(len + 1024);
